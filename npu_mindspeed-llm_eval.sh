@@ -121,7 +121,7 @@ run_dp() {
     export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-$(seq -s, 0 $((num_devices - 1)))}"
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
-        --model megatron_lm \
+        --model mindspeed_lm \
         --model_args "$(base_model_args),devices=${num_devices},use_checkpoint_args=false" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
@@ -140,7 +140,7 @@ run_tp() {
     export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-$(seq -s, 0 $((num_devices - 1)))}"
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
-        --model megatron_lm \
+        --model mindspeed_lm \
         --model_args "$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${num_devices},use_checkpoint_args=false" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
