@@ -26,30 +26,36 @@ Note: Pipeline Parallelism (PP > 1) is NOT currently supported.
 
 Requirements:
     - Megatron-LM must be installed or accessible via MEGATRON_PATH environment variable
-    - PyTorch with CUDA support
+    - PyTorch with CUDA or NPU (Ascend, via torch_npu) support
 
 Usage Examples:
     # Set MEGATRON_PATH environment variable
     export MEGATRON_PATH=/path/to/Megatron-LM
 
-    # Single GPU evaluation
-    torchrun --nproc_per_node=1 -m lm_eval --model megatron_lm \
+    # Single GPU evaluation (CUDA)
+    torchrun --nproc_per-node=1 -m lm_eval --model megatron_lm \
         --model_args load=/path/to/ckpt,tokenizer_model=/path/to/tokenizer.model \
         --tasks arc_easy --batch_size 8
 
     # Data Parallelism (4 GPUs, each with full model replica)
-    torchrun --nproc_per_node=4 -m lm_eval --model megatron_lm \
+    torchrun --nproc-per-node=4 -m lm_eval --model megatron_lm \
         --model_args load=/path/to/ckpt,devices=4,tokenizer_model=/path/to/tokenizer.model \
         --tasks arc_easy --batch_size 8
 
     # Tensor Parallelism (2 GPUs for TP)
-    torchrun --nproc_per_node=2 -m lm_eval --model megatron_lm \
+    torchrun --nproc-per-node=2 -m lm_eval --model megatron_lm \
         --model_args load=/path/to/ckpt,devices=2,tensor_model_parallel_size=2,tokenizer_model=/path/to/tokenizer.model \
         --tasks arc_easy --batch_size 8
 
     # Expert Parallelism for MoE models (6 GPUs, EP=6)
-    torchrun --nproc_per_node=6 -m lm_eval --model megatron_lm \
+    torchrun --nproc-per-node=6 -m lm_eval --model megatron_lm \
         --model_args load=/path/to/moe_ckpt,devices=6,expert_model_parallel_size=6,tokenizer_model=/path/to/tokenizer.model \
+        --tasks arc_easy --batch_size 8
+
+    # NPU (Ascend) evaluation - set device visibility and use torch_npu
+    export ASCEND_RT_VISIBLE_DEVICES=0,1
+    torchrun --nproc-per-node=2 -m lm_eval --model megatron_lm \
+        --model_args load=/path/to/ckpt,devices=2,tensor_model_parallel_size=2,tokenizer_model=/path/to/tokenizer.model \
         --tasks arc_easy --batch_size 8
 """
 
@@ -64,6 +70,11 @@ from tqdm import tqdm
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
+from lm_eval.device import (
+    get_current_device,
+    get_distributed_backend,
+    _is_torch_npu_available,
+)
 from lm_eval.models.utils import Collator
 from lm_eval.utils import get_rolling_token_windows, make_disjoint_window
 
@@ -313,6 +324,11 @@ class MegatronLMEval(LM):
         os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
         os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 
+        # Set distributed backend for NPU (HCCL) if available
+        if _is_torch_npu_available():
+            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+            os.environ.setdefault("MASTER_PORT", "29500")
+
         from megatron.training import (
             get_args,
             get_model,
@@ -357,6 +373,10 @@ class MegatronLMEval(LM):
             "--attention-softmax-in-fp32",
             "--exit-on-missing-checkpoint",
         ]
+
+        # Set distributed backend based on device type (auto-detected via device.py)
+        # CUDA -> nccl, NPU -> hccl, XPU -> ccl, etc.
+        argv.extend(["--distributed-backend", get_distributed_backend()])
 
         argv.extend(["--micro-batch-size", str(kwargs["micro_batch_size"])])
 
@@ -422,7 +442,7 @@ class MegatronLMEval(LM):
             self._dp_rank = parallel_state.get_data_parallel_rank()
 
             # Set up device and rank info based on parallelism mode
-            self._device = torch.device(f"cuda:{torch.cuda.current_device()}")
+            self._device = get_current_device()
             self._global_rank = (
                 torch.distributed.get_rank()
                 if torch.distributed.is_initialized()
@@ -1259,8 +1279,15 @@ class MegatronLMEval(LM):
                             next_token_logits, dim=-1, keepdim=True
                         )  # [batch_size, 1]
 
-                    # For Model Parallelism, broadcast next_tokens to all ranks for consistency
-                    if self._parallelism_mode == "model_parallel":
+                    # For Tensor Parallelism, ensure all ranks produce consistent next_tokens.
+                    # While TP's internal all-reduce makes logits identical across ranks,
+                    # sampling (temperature > 0) uses torch.multinomial which is nondeterministic.
+                    # Broadcast from rank 0 to guarantee all TP ranks generate the same tokens.
+                    if (
+                        self._parallelism_mode == "tensor_parallel"
+                        and torch.distributed.is_initialized()
+                        and temperature > 0
+                    ):
                         torch.distributed.broadcast(next_tokens, src=0)
 
                     # Process each sample in the batch
