@@ -748,16 +748,7 @@ class MegatronLMEval(LM):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Model forward pass with Pipeline Parallelism support.
-
-        Barriers are placed before and after the forward pass to ensure all ranks
-        are synchronized during model computation.
-
-        For PP > 1:
-        - First stage receives input embeddings
-        - Intermediate stages process hidden states
-        - Last stage produces logits
-        - Logits are broadcast to all PP ranks
+        Model forward pass.
 
         For EP > 1 (Expert Parallelism):
         - MoE layers use all-to-all communication which provides implicit synchronization
@@ -1259,8 +1250,15 @@ class MegatronLMEval(LM):
                             next_token_logits, dim=-1, keepdim=True
                         )  # [batch_size, 1]
 
-                    # For Model Parallelism, broadcast next_tokens to all ranks for consistency
-                    if self._parallelism_mode == "model_parallel":
+                    # For Tensor Parallelism, ensure all ranks produce consistent next_tokens.
+                    # While TP's internal all-reduce makes logits identical across ranks,
+                    # sampling (temperature > 0) uses torch.multinomial which is nondeterministic.
+                    # Broadcast from rank 0 to guarantee all TP ranks generate the same tokens.
+                    if (
+                        self._parallelism_mode == "tensor_parallel"
+                        and torch.distributed.is_initialized()
+                        and temperature > 0
+                    ):
                         torch.distributed.broadcast(next_tokens, src=0)
 
                     # Process each sample in the batch

@@ -25,36 +25,37 @@ Parallelism Modes:
 Note: Pipeline Parallelism (PP > 1) is NOT currently supported.
 
 Requirements:
-    - Megatron-LM must be installed or accessible via MEGATRON_PATH environment variable
+    - MindSpeed-LLM must be installed and accessible via MEGATRON_PATH environment variable
     - PyTorch with CUDA or NPU (Ascend, via torch_npu) support
+    - torch_npu package for NPU (Ascend) support
 
 Usage Examples:
     # Set MEGATRON_PATH environment variable
-    export MEGATRON_PATH=/path/to/Megatron-LM
+    export MEGATRON_PATH=/path/to/MindSpeed-LLM
 
     # Single GPU evaluation (CUDA)
-    torchrun --nproc_per-node=1 -m lm_eval --model megatron_lm \
+    torchrun --nproc-per-node=1 -m lm_eval --model mindspeed_lm \
         --model_args load=/path/to/ckpt,tokenizer_model=/path/to/tokenizer.model \
         --tasks arc_easy --batch_size 8
 
     # Data Parallelism (4 GPUs, each with full model replica)
-    torchrun --nproc-per-node=4 -m lm_eval --model megatron_lm \
+    torchrun --nproc-per-node=4 -m lm_eval --model mindspeed_lm \
         --model_args load=/path/to/ckpt,devices=4,tokenizer_model=/path/to/tokenizer.model \
         --tasks arc_easy --batch_size 8
 
     # Tensor Parallelism (2 GPUs for TP)
-    torchrun --nproc-per-node=2 -m lm_eval --model megatron_lm \
+    torchrun --nproc-per-node=2 -m lm_eval --model mindspeed_lm \
         --model_args load=/path/to/ckpt,devices=2,tensor_model_parallel_size=2,tokenizer_model=/path/to/tokenizer.model \
         --tasks arc_easy --batch_size 8
 
     # Expert Parallelism for MoE models (6 GPUs, EP=6)
-    torchrun --nproc-per-node=6 -m lm_eval --model megatron_lm \
+    torchrun --nproc-per-node=6 -m lm_eval --model mindspeed_lm \
         --model_args load=/path/to/moe_ckpt,devices=6,expert_model_parallel_size=6,tokenizer_model=/path/to/tokenizer.model \
         --tasks arc_easy --batch_size 8
 
     # NPU (Ascend) evaluation - set device visibility and use torch_npu
     export ASCEND_RT_VISIBLE_DEVICES=0,1
-    torchrun --nproc-per-node=2 -m lm_eval --model megatron_lm \
+    torchrun --nproc-per-node=2 -m lm_eval --model mindspeed_lm \
         --model_args load=/path/to/ckpt,devices=2,tensor_model_parallel_size=2,tokenizer_model=/path/to/tokenizer.model \
         --tasks arc_easy --batch_size 8
 """
@@ -938,16 +939,7 @@ class MindSpeedLMEval(LM):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Model forward pass with Pipeline Parallelism support.
-
-        Barriers are placed before and after the forward pass to ensure all ranks
-        are synchronized during model computation.
-
-        For PP > 1:
-        - First stage receives input embeddings
-        - Intermediate stages process hidden states
-        - Last stage produces logits
-        - Logits are broadcast to all PP ranks
+        Model forward pass.
 
         For EP > 1 (Expert Parallelism):
         - MoE layers use all-to-all communication which provides implicit synchronization
