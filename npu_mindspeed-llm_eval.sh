@@ -26,9 +26,9 @@ set -euo pipefail
 # Configurable variables (override via environment or edit directly)
 # ---------------------------------------------------------------------------
 # Megatron-LM path
-: "${MEGATRON_PATH:=/path/to/Megatron-LM}"
+: "${MEGATRON_PATH:=/home/jianzhnie/llmtuner/llm/MindSpeed-LLM}"
 export MEGATRON_PATH
-
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 # Checkpoint & tokenizer
 : "${CKPT_PATH:=/path/to/checkpoint}"
 : "${TOKENIZER_MODEL:=/path/to/tokenizer.model}"
@@ -70,7 +70,7 @@ check_env() {
         exit 1
     fi
 
-    if [ ! -f "${TOKENIZER_MODEL}" ]; then
+    if [ ! -e "${TOKENIZER_MODEL}" ]; then
         log_error "Tokenizer model not found: ${TOKENIZER_MODEL}"
         log_error "Please set TOKENIZER_MODEL to your tokenizer file path"
         exit 1
@@ -102,8 +102,8 @@ run_single() {
     export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0}"
 
     torchrun --nproc-per-node=1 -m lm_eval \
-        --model megatron_lm \
-        --model_args "$(base_model_args),devices=1" \
+        --model mindspeed_lm \
+        --model_args "$(base_model_args),devices=1,use_checkpoint_args=false" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${OUTPUT_PATH}/single" \
@@ -122,7 +122,7 @@ run_dp() {
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
         --model megatron_lm \
-        --model_args "$(base_model_args),devices=${num_devices}" \
+        --model_args "$(base_model_args),devices=${num_devices},use_checkpoint_args=false" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${OUTPUT_PATH}/dp_${num_devices}" \
@@ -141,7 +141,7 @@ run_tp() {
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
         --model megatron_lm \
-        --model_args "$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${num_devices}" \
+        --model_args "$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${num_devices},use_checkpoint_args=false" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${OUTPUT_PATH}/tp_${num_devices}" \
@@ -160,7 +160,7 @@ run_ep() {
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
         --model megatron_lm \
-        --model_args "$(base_model_args),devices=${num_devices},expert_model_parallel_size=${num_devices}" \
+        --model_args "$(base_model_args),devices=${num_devices},expert_model_parallel_size=${num_devices},use_checkpoint_args=false" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${OUTPUT_PATH}/ep_${num_devices}" \
@@ -172,11 +172,13 @@ run_ep() {
 #   Allows arbitrary Megatron-LM configurations.
 #
 #   Additional environment variables:
-#     TP_SIZE        - Tensor parallelism size (default: 1)
-#     EP_SIZE        - Expert parallelism size (default: 1)
-#     SEQ_LENGTH     - Maximum sequence length (default: 4096)
-#     MAX_GEN_TOKS   - Maximum tokens to generate (default: 256)
-#     EXTRA_ARGS     - Extra Megatron-LM arguments (space-separated)
+#     TP_SIZE              - Tensor parallelism size (default: 1)
+#     EP_SIZE              - Expert parallelism size (default: 1)
+#     SEQ_LENGTH           - Maximum sequence length (default: 4096)
+#     MAX_GEN_TOKS         - Maximum tokens to generate (default: 256)
+#     USE_CHECKPOINT_ARGS  - Whether to load model args from checkpoint (default: false)
+#                            Set to "true" only if checkpoint tokenizer is compatible.
+#     EXTRA_ARGS           - Extra Megatron-LM arguments (space-separated)
 #
 #   Example:
 #     TP_SIZE=2 EP_SIZE=1 NUM_DEVICES=2 \
@@ -186,18 +188,21 @@ run_ep() {
 run_custom() {
     local num_devices="${NUM_DEVICES:-1}"
     local tp_size="${TP_SIZE:-1}"
+    local pp_size="${PP_SIZE:-1}"
     local ep_size="${EP_SIZE:-1}"
     local seq_length="${SEQ_LENGTH:-4096}"
     local max_gen_toks="${MAX_GEN_TOKS:-256}"
 
     log_info "=== Mode: Custom ==="
-    log_info "  devices=${num_devices}, TP=${tp_size}, EP=${ep_size}"
+    log_info "  devices=${num_devices}, TP=${tp_size}, PP=${pp_size}, EP=${ep_size}"
     log_info "  seq_length=${seq_length}, max_gen_toks=${max_gen_toks}"
 
     export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-$(seq -s, 0 $((num_devices - 1)))}"
 
+    local use_ckpt_args="${USE_CHECKPOINT_ARGS:-false}"
+
     local model_args
-    model_args="$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${tp_size},expert_model_parallel_size=${ep_size},seq_length=${seq_length},max_gen_toks=${max_gen_toks}"
+    model_args="$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${tp_size},pipeline_model_parallel_size=${pp_size},expert_model_parallel_size=${ep_size},seq_length=${seq_length},max_gen_toks=${max_gen_toks},use_checkpoint_args=${use_ckpt_args}"
 
     if [ -n "${EXTRA_ARGS:-}" ]; then
         model_args="${model_args},extra_args=\"${EXTRA_ARGS}\""
