@@ -40,6 +40,7 @@ MODEL_MAPPING = {
     "local-completions": "lm_eval.models.openai_completions:LocalCompletionsAPI",
     "mamba_ssm": "lm_eval.models.mamba_lm:MambaLMWrapper",
     "megatron_lm": "lm_eval.models.megatron_lm:MegatronLMEval",
+    "mindspeed_lm": "lm_eval.models.mindspeed_lm:MindSpeedLMEval",
     "nemo_lm": "lm_eval.models.nemo_lm:NeMoLM",
     "neuronx": "lm_eval.models.neuron_optimum:NeuronModelForCausalLM",
     "openai-chat-completions": "lm_eval.models.openai_completions:OpenAIChatCompletion",

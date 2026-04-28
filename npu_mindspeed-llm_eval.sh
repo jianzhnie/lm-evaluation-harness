@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# NPU (Ascend) + Megatron-LM Evaluation Script
+# NPU (Ascend) + MindSpeed-LLM Evaluation Script
 # =============================================================================
 # Prerequisites:
 #   1. CANN driver & toolkit installed (see Huawei Ascend documentation)
@@ -9,8 +9,8 @@
 #   4. lm-eval installed:    pip install -e ".[hf]"
 #
 # Usage:
-#   bash npu_megatron_llm_eval.sh
-#   bash npu_megatron_llm_eval.sh <mode>
+#   bash npu_mindspeed-llm_eval.sh
+#   bash npu_mindspeed-llm_eval.sh <mode>
 #
 # Modes:
 #   single  - Single NPU evaluation (default)
@@ -26,9 +26,8 @@ set -euo pipefail
 # Configurable variables (override via environment or edit directly)
 # ---------------------------------------------------------------------------
 # MindSpeed-LLM path (set MEGATRON_PATH to MindSpeed-LLM root)
-: "${MEGATRON_PATH:=/home/jianzhnie/llmtuner/llm/MindSpeed-LLM}"
+: "${MEGATRON_PATH:=/path/to/MindSpeed-LLM}"
 export MEGATRON_PATH
-export CUDA_DEVICE_MAX_CONNECTIONS=1
 # Checkpoint & tokenizer
 : "${CKPT_PATH:=/path/to/checkpoint}"
 : "${TOKENIZER_MODEL:=/path/to/tokenizer.model}"
@@ -103,7 +102,7 @@ run_single() {
 
     torchrun --nproc-per-node=1 -m lm_eval \
         --model mindspeed_lm \
-        --model_args "$(base_model_args),devices=1,use_checkpoint_args=false" \
+        --model_args "$(base_model_args),devices=1" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${OUTPUT_PATH}/single" \
@@ -122,7 +121,7 @@ run_dp() {
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
         --model mindspeed_lm \
-        --model_args "$(base_model_args),devices=${num_devices},use_checkpoint_args=false" \
+        --model_args "$(base_model_args),devices=${num_devices}" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${OUTPUT_PATH}/dp_${num_devices}" \
@@ -137,11 +136,12 @@ run_tp() {
     local num_devices="${NUM_DEVICES:-2}"
     log_info "=== Mode: Tensor Parallelism (TP=${num_devices}) ==="
 
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
     export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-$(seq -s, 0 $((num_devices - 1)))}"
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
         --model mindspeed_lm \
-        --model_args "$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${num_devices},use_checkpoint_args=false" \
+        --model_args "$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${num_devices}" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${OUTPUT_PATH}/tp_${num_devices}" \
@@ -160,7 +160,7 @@ run_ep() {
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
         --model mindspeed_lm \
-        --model_args "$(base_model_args),devices=${num_devices},expert_model_parallel_size=${num_devices},use_checkpoint_args=false" \
+        --model_args "$(base_model_args),devices=${num_devices},expert_model_parallel_size=${num_devices}" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${OUTPUT_PATH}/ep_${num_devices}" \
@@ -197,12 +197,22 @@ run_custom() {
     log_info "  devices=${num_devices}, TP=${tp_size}, PP=${pp_size}, EP=${ep_size}"
     log_info "  seq_length=${seq_length}, max_gen_toks=${max_gen_toks}"
 
+    # CUDA_DEVICE_MAX_CONNECTIONS=1 is recommended for tensor parallelism
+    if [ "${tp_size}" -gt 1 ]; then
+        export CUDA_DEVICE_MAX_CONNECTIONS=1
+    fi
+
     export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-$(seq -s, 0 $((num_devices - 1)))}"
 
     local use_ckpt_args="${USE_CHECKPOINT_ARGS:-false}"
 
     local model_args
-    model_args="$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${tp_size},pipeline_model_parallel_size=${pp_size},expert_model_parallel_size=${ep_size},seq_length=${seq_length},max_gen_toks=${max_gen_toks},use_checkpoint_args=${use_ckpt_args}"
+    model_args="$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${tp_size},pipeline_model_parallel_size=${pp_size},expert_model_parallel_size=${ep_size},seq_length=${seq_length},max_gen_toks=${max_gen_toks}"
+
+    # Only pass use_checkpoint_args when explicitly set (default is True in Python)
+    if [ -n "${USE_CHECKPOINT_ARGS:-}" ]; then
+        model_args="${model_args},use_checkpoint_args=${USE_CHECKPOINT_ARGS}"
+    fi
 
     if [ -n "${EXTRA_ARGS:-}" ]; then
         model_args="${model_args},extra_args=\"${EXTRA_ARGS}\""
