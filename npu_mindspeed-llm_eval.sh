@@ -25,7 +25,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Configurable variables (override via environment or edit directly)
 # ---------------------------------------------------------------------------
-# Megatron-LM path
+# MindSpeed-LLM path (set MEGATRON_PATH to MindSpeed-LLM root)
 : "${MEGATRON_PATH:=/home/jianzhnie/llmtuner/llm/MindSpeed-LLM}"
 export MEGATRON_PATH
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -159,7 +159,7 @@ run_ep() {
     export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-$(seq -s, 0 $((num_devices - 1)))}"
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
-        --model megatron_lm \
+        --model mindspeed_lm \
         --model_args "$(base_model_args),devices=${num_devices},expert_model_parallel_size=${num_devices},use_checkpoint_args=false" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
@@ -210,7 +210,7 @@ run_custom() {
     fi
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
-        --model megatron_lm \
+        --model mindspeed_lm \
         --model_args "${model_args}" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
