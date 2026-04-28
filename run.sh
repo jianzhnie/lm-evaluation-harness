@@ -24,6 +24,7 @@ export TP_SIZE="${TP_SIZE:-4}"
 export PP_SIZE="${PP_SIZE:-1}"
 export NUM_DEVICES="${NUM_DEVICES:-4}"
 export SEQ_LENGTH="${SEQ_LENGTH:-4096}"
+export BATCH_SIZE="${BATCH_SIZE:-8}"
 export OUTPUT_PATH="${OUTPUT_PATH:-results/eval}"
 
 bash "$(dirname "$0")/npu_mindspeed-llm_eval.sh" custom

@@ -176,8 +176,9 @@ run_ep() {
 #     EP_SIZE              - Expert parallelism size (default: 1)
 #     SEQ_LENGTH           - Maximum sequence length (default: 4096)
 #     MAX_GEN_TOKS         - Maximum tokens to generate (default: 256)
-#     USE_CHECKPOINT_ARGS  - Whether to load model args from checkpoint (default: false)
-#                            Set to "true" only if checkpoint tokenizer is compatible.
+#     USE_CHECKPOINT_ARGS  - Whether to load model args from checkpoint (default: true when unset)
+#                            Set to "false" if checkpoint overrides your tokenizer type or
+#                            if you want to use HuggingFaceTokenizer with a directory path.
 #     EXTRA_ARGS           - Extra Megatron-LM arguments (space-separated)
 #
 #   Example:

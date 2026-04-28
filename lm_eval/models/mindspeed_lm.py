@@ -392,13 +392,20 @@ class MindSpeedLMEval(LM):
         Supported modes:
         1. Data Parallelism: tp=1, pp=1, devices>1 (with optional EP)
         2. Tensor Parallelism: tp == devices, pp=1
-        3. Pipeline + Tensor Parallelism: tp * pp == devices
-        4. Single GPU: devices=1
+        3. Single GPU: devices=1
 
         For Expert Parallelism (EP > 1):
         - EP cannot be combined with TP or PP (must have TP=1, PP=1)
         - EP must equal devices (each expert parallel rank is also a data parallel rank)
+
+        Note: Pipeline Parallelism (PP > 1) is NOT currently supported.
         """
+        # Validate PP configuration - PP > 1 is not supported
+        assert pp == 1, (
+            f"Pipeline Parallelism (PP={pp}) is not currently supported. "
+            f"Please use Tensor Parallelism (TP) or Data Parallelism instead."
+        )
+
         # Validate EP configuration
         if ep > 1:
             # EP cannot be combined with TP or PP
@@ -415,8 +422,8 @@ class MindSpeedLMEval(LM):
                     f"When using Expert Parallelism (EP > 1), devices must equal expert-model-parallel-size."
                 )
 
-        # Handle Parallelism Modes
-        if tp == 1 and pp == 1:
+        # At this point, pp == 1 is guaranteed (pp > 1 was rejected above)
+        if tp == 1:
             if devices == 1:
                 self._parallelism_mode = "single"
                 eval_logger.info("Parallelism mode: Single GPU")
@@ -430,20 +437,14 @@ class MindSpeedLMEval(LM):
                     eval_logger.info(
                         f"Parallelism mode: Data Parallel with {devices} replicas"
                     )
-        elif tp * pp == devices:
-            if pp > 1:
-                self._parallelism_mode = "pipeline_tensor_parallel"
-                eval_logger.info(
-                    f"Parallelism mode: Pipeline + Tensor Parallel (TP={tp}, PP={pp})"
-                )
-            else:
-                self._parallelism_mode = "tensor_parallel"
-                eval_logger.info(f"Parallelism mode: Tensor Parallel (TP={tp})")
+        elif tp == devices:
+            self._parallelism_mode = "tensor_parallel"
+            eval_logger.info(f"Parallelism mode: Tensor Parallel (TP={tp})")
         else:
             raise ValueError(
-                f"Invalid parallelism configuration: devices={devices}, TP={tp}, PP={pp}. "
-                f"The product of TP * PP ({tp * pp}) must equal the number of devices ({devices}) "
-                f"unless using Data Parallelism (TP=1, PP=1)."
+                f"Invalid parallelism configuration: devices={devices}, TP={tp}. "
+                f"For tensor parallelism, TP must equal devices. "
+                f"For data parallelism, set TP=1."
             )
 
     def _initialize_megatron(self, **kwargs):
