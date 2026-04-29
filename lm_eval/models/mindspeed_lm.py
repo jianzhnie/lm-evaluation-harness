@@ -289,6 +289,18 @@ class MindSpeedLMEval(LM):
             to use HuggingFaceTokenizer with a directory path.
         use_dist_ckpt: Whether to use distributed checkpoint format (auto-detected)
         extra_args: Extra MCore command line arguments, space-separated
+        seed: Random seed for reproducibility (default: 42)
+        spec: Custom layer spec module path, e.g. "mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec".
+            Required for models with custom architectures (Qwen3, etc.).
+        num_layers: Number of transformer layers (if not using --use-checkpoint-args)
+        hidden_size: Hidden dimension size (if not using --use-checkpoint-args)
+        num_attention_heads: Number of attention heads (if not using --use-checkpoint-args)
+        ffn_hidden_size: FFN hidden dimension size (if not using --use-checkpoint-args)
+        num_query_groups: Number of query groups for GQA (if not using --use-checkpoint-args)
+        max_position_embeddings: Maximum position embeddings (if not using --use-checkpoint-args)
+        padded_vocab_size: Padded vocabulary size (may be needed even with --use-checkpoint-args)
+        make_vocab_size_divisible_by: Make vocab size divisible by this value
+        rotary_base: Base for rotary position embeddings (default: 10000)
     """
 
     def __init__(
@@ -309,12 +321,19 @@ class MindSpeedLMEval(LM):
         use_checkpoint_args: bool = True,
         use_dist_ckpt: bool | None = None,
         extra_args: str | None = None,
+        seed: int = 42,
+        # Custom layer spec module path (e.g. "mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec")
+        spec: str | None = None,
         # Model parameters (if not using --use-checkpoint-args)
         num_layers: int | None = None,
         hidden_size: int | None = None,
         num_attention_heads: int | None = None,
         ffn_hidden_size: int | None = None,
         num_query_groups: int | None = None,
+        max_position_embeddings: int | None = None,
+        padded_vocab_size: int | None = None,
+        make_vocab_size_divisible_by: int | None = None,
+        rotary_base: float | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -371,11 +390,17 @@ class MindSpeedLMEval(LM):
             use_checkpoint_args=use_checkpoint_args,
             use_dist_ckpt=use_dist_ckpt,
             extra_args=extra_args,
+            seed=seed,
+            spec=spec,
             num_layers=num_layers,
             hidden_size=hidden_size,
             num_attention_heads=num_attention_heads,
             ffn_hidden_size=ffn_hidden_size,
             num_query_groups=num_query_groups,
+            max_position_embeddings=max_position_embeddings,
+            padded_vocab_size=padded_vocab_size,
+            make_vocab_size_divisible_by=make_vocab_size_divisible_by,
+            rotary_base=rotary_base,
         )
 
         eval_logger.info(f"MindSpeed-LLM model loaded from {load}")
@@ -522,6 +547,7 @@ class MindSpeedLMEval(LM):
             str(kwargs["seq_length"]),
             "--tokenizer-type",
             kwargs["tokenizer_type"],
+            "--use-mcore-models",
             "--no-load-optim",
             "--no-load-rng",
             "--bf16",
@@ -530,6 +556,8 @@ class MindSpeedLMEval(LM):
             "--no-bias-dropout-fusion",
             "--attention-softmax-in-fp32",
             "--exit-on-missing-checkpoint",
+            "--seed",
+            str(kwargs.get("seed", 42)),
         ]
 
         # Set distributed backend based on device type (auto-detected via device.py)
@@ -545,6 +573,10 @@ class MindSpeedLMEval(LM):
         if kwargs.get("use_dist_ckpt"):
             argv.append("--use-dist-ckpt")
             argv.append("--auto-detect-ckpt-format")
+
+        # Custom layer spec (e.g. "mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec")
+        if kwargs.get("spec"):
+            argv.extend(["--spec", kwargs["spec"]])
 
         if kwargs.get("tokenizer_model"):
             argv.extend(["--tokenizer-model", kwargs["tokenizer_model"]])
@@ -569,6 +601,15 @@ class MindSpeedLMEval(LM):
                 if val is not None:
                     arg_name = key.replace("_", "-")
                     argv.extend([f"--{arg_name}", str(val)])
+
+        # Architecture args that may be needed even with use_checkpoint_args
+        # (these are not always stored in checkpoints)
+        if kwargs.get("padded_vocab_size") is not None:
+            argv.extend(["--padded-vocab-size", str(kwargs["padded_vocab_size"])])
+        if kwargs.get("make_vocab_size_divisible_by") is not None:
+            argv.extend(["--make-vocab-size-divisible-by", str(kwargs["make_vocab_size_divisible_by"])])
+        if kwargs.get("rotary_base") is not None:
+            argv.extend(["--rotary-base", str(kwargs["rotary_base"])])
 
         # Add extra MCore arguments
         extra_args_list = _parse_extra_args(kwargs.get("extra_args"))
@@ -659,10 +700,14 @@ class MindSpeedLMEval(LM):
                     config = core_transformer_config_from_args(args)
 
                 # Select layer spec.
-                # For MoE models, use decoder block spec so each layer follows moe_layer_freq.
-                transformer_impl = getattr(args, "transformer_impl", "local")
-                use_transformer_engine = transformer_impl == "transformer_engine"
-                if args.num_experts:
+                # Priority: --spec > MoE > heterogeneous > TE > local
+                if args.spec is not None:
+                    from megatron.core.transformer.spec_utils import import_module
+                    transformer_layer_spec = import_module(args.spec)
+                elif args.num_experts:
+                    # For MoE models, use decoder block spec so each layer follows moe_layer_freq.
+                    transformer_impl = getattr(args, "transformer_impl", "local")
+                    use_transformer_engine = transformer_impl == "transformer_engine"
                     assert config.transformer_impl != "inference_optimized", (
                         "MoE is not supported with inference_optimized transformer_impl."
                     )
@@ -672,27 +717,30 @@ class MindSpeedLMEval(LM):
                         normalization=getattr(args, "normalization", None),
                         qk_l2_norm=getattr(args, "qk_l2_norm", False),
                     )
-                elif args.heterogeneous_layers_config_path is not None:
-                    assert config.transformer_impl != "inference_optimized", (
-                        "Heterogeneous layers are not supported with inference_optimized transformer_impl."
-                    )
-                    transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
-                        config, use_transformer_engine=use_transformer_engine
-                    )
-                elif use_transformer_engine:
-                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                        getattr(args, "num_experts", None),
-                        getattr(args, "moe_grouped_gemm", False),
-                        getattr(args, "qk_layernorm", False),
-                        getattr(args, "multi_latent_attention", False),
-                    )
                 else:
-                    transformer_layer_spec = get_gpt_layer_local_spec(
-                        getattr(args, "num_experts", None),
-                        getattr(args, "moe_grouped_gemm", False),
-                        getattr(args, "qk_layernorm", False),
-                        getattr(args, "multi_latent_attention", False),
-                    )
+                    transformer_impl = getattr(args, "transformer_impl", "local")
+                    use_transformer_engine = transformer_impl == "transformer_engine"
+                    if args.heterogeneous_layers_config_path is not None:
+                        assert config.transformer_impl != "inference_optimized", (
+                            "Heterogeneous layers are not supported with inference_optimized transformer_impl."
+                        )
+                        transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
+                            config, use_transformer_engine=use_transformer_engine
+                        )
+                    elif use_transformer_engine:
+                        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                            getattr(args, "num_experts", None),
+                            getattr(args, "moe_grouped_gemm", False),
+                            getattr(args, "qk_layernorm", False),
+                            getattr(args, "multi_latent_attention", False),
+                        )
+                    else:
+                        transformer_layer_spec = get_gpt_layer_local_spec(
+                            getattr(args, "num_experts", None),
+                            getattr(args, "moe_grouped_gemm", False),
+                            getattr(args, "qk_layernorm", False),
+                            getattr(args, "multi_latent_attention", False),
+                        )
 
                 # Force SelfAttention's default attn_mask_type to `arbitrary` so TE uses the
                 # provided 4D attention mask (causal + padding) instead of assuming a causal-only
@@ -746,7 +794,7 @@ class MindSpeedLMEval(LM):
                     config=config,
                     transformer_layer_spec=transformer_layer_spec,
                     vocab_size=args.padded_vocab_size,
-                    max_sequence_length=args.seq_length,
+                    max_sequence_length=getattr(args, "max_position_embeddings", args.seq_length),
                     pre_process=pre_process,
                     post_process=post_process,
                     fp16_lm_cross_entropy=getattr(args, "fp16_lm_cross_entropy", False),
