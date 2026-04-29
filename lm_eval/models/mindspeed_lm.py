@@ -1,5 +1,5 @@
 r"""
-Megatron-LM backend for lm-evaluation-harness.
+MindSpeed-LLM backend for lm-evaluation-harness.
 
 This module provides support for evaluating Megatron-LM models, including
 both standard checkpoints and distributed checkpoints (.distcp format).
