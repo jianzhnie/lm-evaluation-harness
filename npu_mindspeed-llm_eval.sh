@@ -37,7 +37,7 @@ export MEGATRON_PATH
 : "${TASKS:=hellaswag}"
 : "${BATCH_SIZE:=8}"
 : "${SEED:=42}"
-: "${OUTPUT_PATH:=results/npu_megatron}"
+: "${OUTPUT_PATH:=results/npu_mindspeed}"
 
 # NPU device visibility (override to select specific NPUs)
 # e.g. ASCEND_RT_VISIBLE_DEVICES=0,1,2,3
@@ -217,7 +217,14 @@ run_custom() {
     export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-$(seq -s, 0 $((num_devices - 1)))}"
 
     local model_args
-    model_args="$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${tp_size},pipeline_model_parallel_size=${pp_size},expert_model_parallel_size=${ep_size},seq_length=${seq_length},max_gen_toks=${max_gen_toks},seed=${seed}"
+    model_args="$(base_model_args)"
+    model_args="${model_args},devices=${num_devices}"
+    model_args="${model_args},tensor_model_parallel_size=${tp_size}"
+    model_args="${model_args},pipeline_model_parallel_size=${pp_size}"
+    model_args="${model_args},expert_model_parallel_size=${ep_size}"
+    model_args="${model_args},seq_length=${seq_length}"
+    model_args="${model_args},max_gen_toks=${max_gen_toks}"
+    model_args="${model_args},seed=${seed}"
 
     # Only pass use_checkpoint_args when explicitly set (default is True in Python)
     if [ -n "${USE_CHECKPOINT_ARGS:-}" ]; then

@@ -575,8 +575,9 @@ class MindSpeedLMEval(LM):
             argv.append("--auto-detect-ckpt-format")
 
         # Custom layer spec (e.g. "mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec")
+        # --spec uses nargs='+' in Megatron argparse, so we must split into separate argv elements
         if kwargs.get("spec"):
-            argv.extend(["--spec", kwargs["spec"]])
+            argv.extend(["--spec"] + kwargs["spec"].split())
 
         if kwargs.get("tokenizer_model"):
             argv.extend(["--tokenizer-model", kwargs["tokenizer_model"]])
