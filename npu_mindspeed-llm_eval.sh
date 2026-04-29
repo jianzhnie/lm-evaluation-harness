@@ -36,6 +36,7 @@ export MEGATRON_PATH
 # Evaluation tasks
 : "${TASKS:=hellaswag}"
 : "${BATCH_SIZE:=8}"
+: "${SEED:=42}"
 : "${OUTPUT_PATH:=results/npu_megatron}"
 
 # NPU device visibility (override to select specific NPUs)
@@ -176,6 +177,9 @@ run_ep() {
 #     EP_SIZE              - Expert parallelism size (default: 1)
 #     SEQ_LENGTH           - Maximum sequence length (default: 4096)
 #     MAX_GEN_TOKS         - Maximum tokens to generate (default: 256)
+#     SPEC                 - Custom layer spec module path
+#                            (e.g. "mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec")
+#     SEED                 - Random seed (default: 42)
 #     USE_CHECKPOINT_ARGS  - Whether to load model args from checkpoint (default: true when unset)
 #                            Set to "false" if checkpoint overrides your tokenizer type or
 #                            if you want to use HuggingFaceTokenizer with a directory path.
@@ -184,7 +188,13 @@ run_ep() {
 #   Example:
 #     TP_SIZE=2 EP_SIZE=1 NUM_DEVICES=2 \
 #     EXTRA_ARGS="--no-rope-fusion --trust-remote-code" \
-#     bash npu_megatron_llm_eval.sh custom
+#     bash npu_mindspeed-llm_eval.sh custom
+#
+#   Example with Qwen3:
+#     TP_SIZE=4 NUM_DEVICES=4 \
+#     SPEC="mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec" \
+#     EXTRA_ARGS="--qk-layernorm --use-rotary-position-embeddings --swiglu --disable-bias-linear --group-query-attention --num-query-groups 8 --kv-channels 128 --normalization RMSNorm --position-embedding-type rope --norm-epsilon 1e-6" \
+#     bash npu_mindspeed-llm_eval.sh custom
 # ---------------------------------------------------------------------------
 run_custom() {
     local num_devices="${NUM_DEVICES:-1}"
@@ -193,10 +203,11 @@ run_custom() {
     local ep_size="${EP_SIZE:-1}"
     local seq_length="${SEQ_LENGTH:-4096}"
     local max_gen_toks="${MAX_GEN_TOKS:-256}"
+    local seed="${SEED:-42}"
 
     log_info "=== Mode: Custom ==="
     log_info "  devices=${num_devices}, TP=${tp_size}, PP=${pp_size}, EP=${ep_size}"
-    log_info "  seq_length=${seq_length}, max_gen_toks=${max_gen_toks}"
+    log_info "  seq_length=${seq_length}, max_gen_toks=${max_gen_toks}, seed=${seed}"
 
     # CUDA_DEVICE_MAX_CONNECTIONS=1 is recommended for tensor parallelism
     if [ "${tp_size}" -gt 1 ]; then
@@ -205,14 +216,18 @@ run_custom() {
 
     export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-$(seq -s, 0 $((num_devices - 1)))}"
 
-    local use_ckpt_args="${USE_CHECKPOINT_ARGS:-false}"
-
     local model_args
-    model_args="$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${tp_size},pipeline_model_parallel_size=${pp_size},expert_model_parallel_size=${ep_size},seq_length=${seq_length},max_gen_toks=${max_gen_toks}"
+    model_args="$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${tp_size},pipeline_model_parallel_size=${pp_size},expert_model_parallel_size=${ep_size},seq_length=${seq_length},max_gen_toks=${max_gen_toks},seed=${seed}"
 
     # Only pass use_checkpoint_args when explicitly set (default is True in Python)
     if [ -n "${USE_CHECKPOINT_ARGS:-}" ]; then
         model_args="${model_args},use_checkpoint_args=${USE_CHECKPOINT_ARGS}"
+    fi
+
+    # Custom layer spec for model architectures (e.g., Qwen3)
+    if [ -n "${SPEC:-}" ]; then
+        model_args="${model_args},spec=\"${SPEC}\""
+        log_info "  spec=${SPEC}"
     fi
 
     if [ -n "${EXTRA_ARGS:-}" ]; then
@@ -270,6 +285,7 @@ main() {
             echo "  NUM_DEVICES=4 bash $0 tp"
             echo "  CKPT_PATH=/data/moe_ckpt NUM_DEVICES=8 bash $0 ep"
             echo "  TP_SIZE=2 NUM_DEVICES=2 EXTRA_ARGS='--no-rope-fusion' bash $0 custom"
+            echo "  TP_SIZE=4 NUM_DEVICES=4 SPEC='mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec' bash $0 custom"
             exit 1
             ;;
     esac
