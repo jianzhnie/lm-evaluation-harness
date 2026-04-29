@@ -439,6 +439,14 @@ class TestArgvConstruction:
             lm._tp_size = 1
             lm._pp_size = 1
             lm._ep_size = 1
+            # Set MindSpeed-specific attributes for _initialize_megatron override
+            lm._ms_seed = 42
+            lm._ms_spec = None
+            lm._ms_use_checkpoint_args = True
+            lm._ms_max_position_embeddings = None
+            lm._ms_padded_vocab_size = None
+            lm._ms_make_vocab_size_divisible_by = None
+            lm._ms_rotary_base = None
 
             # Mock all the Megatron imports and calls
             with mock.patch("lm_eval.models.mindspeed_lm._is_torch_npu_available", return_value=False), \
@@ -488,14 +496,8 @@ class TestArgvConstruction:
 
     def test_architecture_args_outside_checkpoint_args(self):
         """Verify padded_vocab_size etc. are added even with use_checkpoint_args=True."""
-        kwargs = self._get_argv(
-            use_checkpoint_args=True,
-            padded_vocab_size=151936,
-            make_vocab_size_divisible_by=1,
-            rotary_base=1000000.0,
-        )
+        kwargs = self._get_argv()
 
-        # These should be added regardless of use_checkpoint_args
         from lm_eval.models.mindspeed_lm import MindSpeedLMEval
 
         with mock.patch.object(MindSpeedLMEval, "__init__", return_value=None):
@@ -505,6 +507,14 @@ class TestArgvConstruction:
             lm._tp_size = 1
             lm._pp_size = 1
             lm._ep_size = 1
+            # Set MindSpeed-specific attributes
+            lm._ms_seed = 42
+            lm._ms_spec = None
+            lm._ms_use_checkpoint_args = True
+            lm._ms_max_position_embeddings = None
+            lm._ms_padded_vocab_size = 151936
+            lm._ms_make_vocab_size_divisible_by = 1
+            lm._ms_rotary_base = 1000000.0
 
             captured_argv = []
 

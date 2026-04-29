@@ -39,7 +39,7 @@ export TP_SIZE="${TP_SIZE:-1}"
 export PP_SIZE="${PP_SIZE:-1}"
 export NUM_DEVICES="${NUM_DEVICES:-1}"
 export SEQ_LENGTH="${SEQ_LENGTH:-4096}"
-export BATCH_SIZE="${BATCH_SIZE:=8}"
+export BATCH_SIZE="${BATCH_SIZE:-8}"
 export SEED="${SEED:-42}"
 export OUTPUT_PATH="${OUTPUT_PATH:-results/eval}"
 
