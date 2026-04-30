@@ -169,7 +169,10 @@ def _maybe_patch_for_npu():
         torch.distributed.init_process_group = _patched_init_process_group
 
 
-def _try_load_hf_config_as_mcore_args(tokenizer_model: str | None) -> dict[str, int]:
+def _try_load_hf_config_as_mcore_args(
+    tokenizer_model: str | None,
+    tokenizer_name_or_path: str | None = None,
+) -> dict[str, int]:
     """Try to load HF config.json and map to Megatron model arguments.
 
     When use_checkpoint_args=False, we need to provide model architecture args
@@ -178,14 +181,23 @@ def _try_load_hf_config_as_mcore_args(tokenizer_model: str | None) -> dict[str, 
 
     Returns a dict of kwargs that can be passed to _initialize_megatron.
     """
-    if tokenizer_model is None:
-        return {}
-
     # Possible locations for config.json
     candidate_dirs = []
-    if os.path.isdir(tokenizer_model):
-        candidate_dirs.append(tokenizer_model)
-    candidate_dirs.append(os.path.dirname(tokenizer_model))
+    for path in (tokenizer_model, tokenizer_name_or_path):
+        if path is not None and os.path.isdir(path):
+            candidate_dirs.append(path)
+            candidate_dirs.append(os.path.dirname(path))
+    # Deduplicate while preserving order
+    seen = set()
+    unique_dirs = []
+    for d in candidate_dirs:
+        if d not in seen:
+            seen.add(d)
+            unique_dirs.append(d)
+    candidate_dirs = unique_dirs
+
+    if not candidate_dirs:
+        return {}
 
     config_path = None
     for d in candidate_dirs:
@@ -603,7 +615,10 @@ class MindSpeedLMEval(LM):
             argv.append("--use-checkpoint-args")
         else:
             eval_logger.info("use_checkpoint_args=False; loading model architecture from kwargs/HF config")
-            auto_args = _try_load_hf_config_as_mcore_args(kwargs.get("tokenizer_model"))
+            auto_args = _try_load_hf_config_as_mcore_args(
+                kwargs.get("tokenizer_model"),
+                kwargs.get("tokenizer_name_or_path"),
+            )
             # Kwargs take precedence over auto-detected values
             for key in ("num_layers", "hidden_size", "num_attention_heads", "ffn_hidden_size", "num_query_groups", "max_position_embeddings"):
                 val = kwargs.get(key)
@@ -702,13 +717,16 @@ class MindSpeedLMEval(LM):
                     get_gpt_layer_local_spec,
                     get_gpt_layer_with_transformer_engine_spec,
                 )
-                from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
-                    get_gpt_heterogeneous_layer_spec,
-                )
 
                 # Get config from args if not provided
                 if config is None:
-                    config = core_transformer_config_from_args(args)
+                    if getattr(args, "yaml_cfg", None) is not None:
+                        from megatron.training.yaml_arguments import (
+                            core_transformer_config_from_yaml,
+                        )
+                        config = core_transformer_config_from_yaml(args, "language_model")
+                    else:
+                        config = core_transformer_config_from_args(args)
 
                 # Select layer spec.
                 # Priority: --spec > MoE > heterogeneous > TE > local
@@ -731,13 +749,28 @@ class MindSpeedLMEval(LM):
                 else:
                     transformer_impl = getattr(args, "transformer_impl", "local")
                     use_transformer_engine = transformer_impl == "transformer_engine"
-                    if args.heterogeneous_layers_config_path is not None:
+                    if getattr(args, "heterogeneous_layers_config_path", None) is not None:
                         assert config.transformer_impl != "inference_optimized", (
                             "Heterogeneous layers are not supported with inference_optimized transformer_impl."
                         )
-                        transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
-                            config, use_transformer_engine=use_transformer_engine
-                        )
+                        try:
+                            from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
+                                get_gpt_heterogeneous_layer_spec,
+                            )
+                            transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
+                                config, use_transformer_engine=use_transformer_engine
+                            )
+                        except ImportError:
+                            eval_logger.warning(
+                                "heterogeneous_layer_spec not available in this Megatron version; "
+                                "falling back to local spec."
+                            )
+                            transformer_layer_spec = get_gpt_layer_local_spec(
+                                getattr(args, "num_experts", None),
+                                getattr(args, "moe_grouped_gemm", False),
+                                getattr(args, "qk_layernorm", False),
+                                getattr(args, "multi_latent_attention", False),
+                            )
                     elif use_transformer_engine:
                         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
                             getattr(args, "num_experts", None),
