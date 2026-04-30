@@ -273,8 +273,9 @@ class MindSpeedLMEval(LM):
     Args:
         load: Megatron checkpoint path (parent directory containing iter_xxx subdirectories)
         ckpt_step: Checkpoint step to load (e.g., 40000 loads iter_0040000), defaults to latest
-        tokenizer_type: Tokenizer type (e.g., GPTSentencePieceTokenizer, Qwen2Tokenizer)
-        tokenizer_model: Tokenizer model file path
+        tokenizer_type: Tokenizer type (e.g., HuggingFaceTokenizer, PretrainedFromHF)
+        tokenizer_model: Tokenizer model file path (used with most tokenizer types)
+        tokenizer_name_or_path: Tokenizer name or path for PretrainedFromHF tokenizer type
         vocab_file: Vocabulary file path (optional)
         merge_file: BPE merge file path (optional)
         devices: Total number of GPUs to use (default: 1)
@@ -309,6 +310,7 @@ class MindSpeedLMEval(LM):
         ckpt_step: int | None = None,
         tokenizer_type: str = "HuggingFaceTokenizer",
         tokenizer_model: str | None = None,
+        tokenizer_name_or_path: str | None = None,
         vocab_file: str | None = None,
         merge_file: str | None = None,
         devices: int = 1,
@@ -379,6 +381,7 @@ class MindSpeedLMEval(LM):
             ckpt_step=ckpt_step,
             tokenizer_type=tokenizer_type,
             tokenizer_model=tokenizer_model,
+            tokenizer_name_or_path=tokenizer_name_or_path,
             vocab_file=vocab_file,
             merge_file=merge_file,
             devices=devices,
@@ -554,8 +557,13 @@ class MindSpeedLMEval(LM):
             "--no-masked-softmax-fusion",
             "--no-bias-gelu-fusion",
             "--no-bias-dropout-fusion",
+            "--no-gradient-accumulation-fusion",
             "--attention-softmax-in-fp32",
             "--exit-on-missing-checkpoint",
+            "--hidden-dropout",
+            "0",
+            "--attention-dropout",
+            "0",
             "--seed",
             str(kwargs.get("seed", 42)),
         ]
@@ -581,6 +589,8 @@ class MindSpeedLMEval(LM):
 
         if kwargs.get("tokenizer_model"):
             argv.extend(["--tokenizer-model", kwargs["tokenizer_model"]])
+        if kwargs.get("tokenizer_name_or_path"):
+            argv.extend(["--tokenizer-name-or-path", kwargs["tokenizer_name_or_path"]])
         if kwargs.get("vocab_file"):
             argv.extend(["--vocab-file", kwargs["vocab_file"]])
         if kwargs.get("merge_file"):
@@ -1384,7 +1394,7 @@ class MindSpeedLMEval(LM):
             attention_mask_list = []
             for tokens in context_tokens_list:
                 pad_len = max_ctx_len - len(tokens)
-                padded_tokens = [0] * pad_len + tokens
+                padded_tokens = [self.eot_token_id] * pad_len + tokens
                 padded_input_ids.append(padded_tokens)
                 # Attention mask: 0 for padding, 1 for real tokens
                 mask = [0] * pad_len + [1] * len(tokens)

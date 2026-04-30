@@ -18,6 +18,23 @@
 #   tp      - Tensor Parallelism (2 NPUs)
 #   ep      - Expert Parallelism for MoE models (4 NPUs)
 #   custom  - Custom configuration via environment variables
+#
+# Examples:
+#   # Single NPU
+#   bash npu_mindspeed-llm_eval.sh single
+#
+#   # Data Parallel with 8 NPUs
+#   NUM_DEVICES=8 bash npu_mindspeed-llm_eval.sh dp
+#
+#   # Tensor Parallel with 4 NPUs
+#   NUM_DEVICES=4 bash npu_mindspeed-llm_eval.sh tp
+#
+#   # Qwen3 with custom spec and extra args
+#   CKPT_PATH=/data/ckpt TOKENIZER_MODEL=/data/tokenizer \
+#   TP_SIZE=4 NUM_DEVICES=4 \
+#   SPEC="mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec" \
+#   EXTRA_ARGS="--qk-layernorm --use-rotary-position-embeddings --swiglu --disable-bias-linear --group-query-attention --num-query-groups 8 --kv-channels 128 --normalization RMSNorm --position-embedding-type rope --norm-epsilon 1e-6" \
+#   bash npu_mindspeed-llm_eval.sh custom
 # =============================================================================
 
 set -euo pipefail
@@ -31,12 +48,17 @@ export MEGATRON_PATH
 # Checkpoint & tokenizer
 : "${CKPT_PATH:=/path/to/checkpoint}"
 : "${TOKENIZER_MODEL:=/path/to/tokenizer.model}"
+# For PretrainedFromHF tokenizer type, set TOKENIZER_NAME_OR_PATH instead:
+# : "${TOKENIZER_NAME_OR_PATH:=/path/to/tokenizer}"
 : "${TOKENIZER_TYPE:=HuggingFaceTokenizer}"
 
 # Evaluation tasks
 : "${TASKS:=hellaswag}"
 : "${BATCH_SIZE:=8}"
+: "${MICRO_BATCH_SIZE:=1}"
 : "${SEED:=42}"
+: "${SEQ_LENGTH:=4096}"
+: "${MAX_GEN_TOKS:=256}"
 : "${OUTPUT_PATH:=results/npu_mindspeed}"
 
 # NPU device visibility (override to select specific NPUs)
@@ -70,9 +92,11 @@ check_env() {
         exit 1
     fi
 
-    if [ ! -e "${TOKENIZER_MODEL}" ]; then
+    # Only check TOKENIZER_MODEL when using tokenizer_model path (not tokenizer_name_or_path)
+    if [ -z "${TOKENIZER_NAME_OR_PATH:-}" ] && [ ! -e "${TOKENIZER_MODEL}" ]; then
         log_error "Tokenizer model not found: ${TOKENIZER_MODEL}"
         log_error "Please set TOKENIZER_MODEL to your tokenizer file path"
+        log_error "Or set TOKENIZER_NAME_OR_PATH for PretrainedFromHF tokenizer type"
         exit 1
     fi
 
@@ -82,15 +106,26 @@ check_env() {
     }
 
     log_info "Environment check passed"
-    log_info "  MEGATRON_PATH          = ${MEGATRON_PATH}"
-    log_info "  CKPT_PATH              = ${CKPT_PATH}"
-    log_info "  TOKENIZER_MODEL        = ${TOKENIZER_MODEL}"
+    log_info "  MEGATRON_PATH             = ${MEGATRON_PATH}"
+    log_info "  CKPT_PATH                 = ${CKPT_PATH}"
+    log_info "  TOKENIZER_TYPE            = ${TOKENIZER_TYPE}"
+    if [ -n "${TOKENIZER_NAME_OR_PATH:-}" ]; then
+        log_info "  TOKENIZER_NAME_OR_PATH    = ${TOKENIZER_NAME_OR_PATH}"
+    else
+        log_info "  TOKENIZER_MODEL           = ${TOKENIZER_MODEL}"
+    fi
     log_info "  ASCEND_RT_VISIBLE_DEVICES = ${ASCEND_RT_VISIBLE_DEVICES:-<all>}"
 }
 
 # Base model args shared across all modes
 base_model_args() {
-    echo "load=${CKPT_PATH},tokenizer_type=${TOKENIZER_TYPE},tokenizer_model=${TOKENIZER_MODEL}"
+    local args="load=${CKPT_PATH},tokenizer_type=${TOKENIZER_TYPE}"
+    if [ -n "${TOKENIZER_NAME_OR_PATH:-}" ]; then
+        args="${args},tokenizer_name_or_path=${TOKENIZER_NAME_OR_PATH}"
+    else
+        args="${args},tokenizer_model=${TOKENIZER_MODEL}"
+    fi
+    echo "${args}"
 }
 
 # ---------------------------------------------------------------------------
@@ -103,7 +138,7 @@ run_single() {
 
     torchrun --nproc-per-node=1 -m lm_eval \
         --model mindspeed_lm \
-        --model_args "$(base_model_args),devices=1" \
+        --model_args "$(base_model_args),devices=1,micro_batch_size=${MICRO_BATCH_SIZE}" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${OUTPUT_PATH}/single" \
@@ -122,7 +157,7 @@ run_dp() {
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
         --model mindspeed_lm \
-        --model_args "$(base_model_args),devices=${num_devices}" \
+        --model_args "$(base_model_args),devices=${num_devices},micro_batch_size=${MICRO_BATCH_SIZE}" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${OUTPUT_PATH}/dp_${num_devices}" \
@@ -142,7 +177,7 @@ run_tp() {
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
         --model mindspeed_lm \
-        --model_args "$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${num_devices}" \
+        --model_args "$(base_model_args),devices=${num_devices},tensor_model_parallel_size=${num_devices},micro_batch_size=${MICRO_BATCH_SIZE}" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${OUTPUT_PATH}/tp_${num_devices}" \
@@ -161,7 +196,7 @@ run_ep() {
 
     torchrun --nproc-per-node="${num_devices}" -m lm_eval \
         --model mindspeed_lm \
-        --model_args "$(base_model_args),devices=${num_devices},expert_model_parallel_size=${num_devices}" \
+        --model_args "$(base_model_args),devices=${num_devices},expert_model_parallel_size=${num_devices},micro_batch_size=${MICRO_BATCH_SIZE}" \
         --tasks "${TASKS}" \
         --batch_size "${BATCH_SIZE}" \
         --output_path "${OUTPUT_PATH}/ep_${num_devices}" \
@@ -174,8 +209,10 @@ run_ep() {
 #
 #   Additional environment variables:
 #     TP_SIZE              - Tensor parallelism size (default: 1)
+#     PP_SIZE              - Pipeline parallelism size (default: 1, PP > 1 not supported)
 #     EP_SIZE              - Expert parallelism size (default: 1)
 #     SEQ_LENGTH           - Maximum sequence length (default: 4096)
+#     MICRO_BATCH_SIZE     - Megatron micro batch size (default: 1)
 #     MAX_GEN_TOKS         - Maximum tokens to generate (default: 256)
 #     SPEC                 - Custom layer spec module path
 #                            (e.g. "mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec")
@@ -185,12 +222,17 @@ run_ep() {
 #                            if you want to use HuggingFaceTokenizer with a directory path.
 #     EXTRA_ARGS           - Extra Megatron-LM arguments (space-separated)
 #
-#   Example:
-#     TP_SIZE=2 EP_SIZE=1 NUM_DEVICES=2 \
-#     EXTRA_ARGS="--no-rope-fusion --trust-remote-code" \
+#   Example (Qwen3-0.6B, single NPU):
+#     CKPT_PATH=/data/qwen3-0.6b/mcore_ckpt \
+#     TOKENIZER_MODEL=/data/qwen3-0.6b/tokenizer.model \
+#     SPEC="mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec" \
+#     EXTRA_ARGS="--qk-layernorm --use-rotary-position-embeddings --swiglu --disable-bias-linear --group-query-attention --num-query-groups 8 --kv-channels 128 --normalization RMSNorm --position-embedding-type rope --norm-epsilon 1e-6 --padded-vocab-size 151936 --make-vocab-size-divisible-by 1 --rotary-base 1000000" \
+#     USE_CHECKPOINT_ARGS=false \
 #     bash npu_mindspeed-llm_eval.sh custom
 #
-#   Example with Qwen3:
+#   Example (Qwen3-8B, TP=4):
+#     CKPT_PATH=/data/qwen3-8b/mcore_tp4_pp1 \
+#     TOKENIZER_MODEL=/data/qwen3-8b \
 #     TP_SIZE=4 NUM_DEVICES=4 \
 #     SPEC="mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec" \
 #     EXTRA_ARGS="--qk-layernorm --use-rotary-position-embeddings --swiglu --disable-bias-linear --group-query-attention --num-query-groups 8 --kv-channels 128 --normalization RMSNorm --position-embedding-type rope --norm-epsilon 1e-6" \
@@ -202,12 +244,13 @@ run_custom() {
     local pp_size="${PP_SIZE:-1}"
     local ep_size="${EP_SIZE:-1}"
     local seq_length="${SEQ_LENGTH:-4096}"
+    local micro_batch_size="${MICRO_BATCH_SIZE:-1}"
     local max_gen_toks="${MAX_GEN_TOKS:-256}"
     local seed="${SEED:-42}"
 
     log_info "=== Mode: Custom ==="
     log_info "  devices=${num_devices}, TP=${tp_size}, PP=${pp_size}, EP=${ep_size}"
-    log_info "  seq_length=${seq_length}, max_gen_toks=${max_gen_toks}, seed=${seed}"
+    log_info "  seq_length=${seq_length}, micro_batch_size=${micro_batch_size}, max_gen_toks=${max_gen_toks}, seed=${seed}"
 
     # CUDA_DEVICE_MAX_CONNECTIONS=1 is recommended for tensor parallelism
     if [ "${tp_size}" -gt 1 ]; then
@@ -223,6 +266,7 @@ run_custom() {
     model_args="${model_args},pipeline_model_parallel_size=${pp_size}"
     model_args="${model_args},expert_model_parallel_size=${ep_size}"
     model_args="${model_args},seq_length=${seq_length}"
+    model_args="${model_args},micro_batch_size=${micro_batch_size}"
     model_args="${model_args},max_gen_toks=${max_gen_toks}"
     model_args="${model_args},seed=${seed}"
 
