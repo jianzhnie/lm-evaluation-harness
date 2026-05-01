@@ -67,4 +67,6 @@ export OUTPUT_PATH="${OUTPUT_PATH:-results/eval}"
 # Qwen3-8B (with use_checkpoint_args=true, mcore checkpoint):
 # export EXTRA_ARGS="--qk-layernorm --use-rotary-position-embeddings --swiglu --disable-bias-linear --group-query-attention --num-query-groups 8 --kv-channels 128 --normalization RMSNorm --position-embedding-type rope --norm-epsilon 1e-6"
 
-bash "$(dirname "$0")/npu_mindspeed-llm_eval.sh" custom
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+bash "${SCRIPT_DIR}/npu_mindspeed-llm_eval.sh" custom

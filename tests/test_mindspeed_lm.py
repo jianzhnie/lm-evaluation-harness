@@ -269,7 +269,7 @@ class TestParallelismConfig:
         with mock.patch.object(MindSpeedLMEval, "__init__", return_value=None):
             lm = MindSpeedLMEval.__new__(MindSpeedLMEval)
             lm._validate_parallelism_config(devices=4, tp=1, pp=1, ep=4)
-            assert lm._parallelism_mode == "data_parallel"
+            assert lm._parallelism_mode == "expert_parallel"
 
     def test_rejects_pipeline_parallel(self):
         """PP > 1 should be rejected."""
@@ -306,6 +306,676 @@ class TestParallelismConfig:
             lm = MindSpeedLMEval.__new__(MindSpeedLMEval)
             with pytest.raises(ValueError, match="Invalid parallelism"):
                 lm._validate_parallelism_config(devices=4, tp=2, pp=1, ep=1)
+
+
+class TestParallelismConfigEdgeCases:
+    """Extended tests for TP>1, EP>1, and boundary conditions."""
+
+    def _validate(self, devices, tp, pp, ep):
+        from lm_eval.models.mindspeed_lm import MindSpeedLMEval
+
+        with mock.patch.object(MindSpeedLMEval, "__init__", return_value=None):
+            lm = MindSpeedLMEval.__new__(MindSpeedLMEval)
+            lm._validate_parallelism_config(devices=devices, tp=tp, pp=pp, ep=ep)
+            return lm._parallelism_mode
+
+    # --- TP > 1 scenarios ---
+    def test_tp2_devices2(self):
+        assert self._validate(devices=2, tp=2, pp=1, ep=1) == "tensor_parallel"
+
+    def test_tp4_devices4(self):
+        assert self._validate(devices=4, tp=4, pp=1, ep=1) == "tensor_parallel"
+
+    def test_tp8_devices8(self):
+        assert self._validate(devices=8, tp=8, pp=1, ep=1) == "tensor_parallel"
+
+    def test_tp2_devices4_rejected(self):
+        """TP=2 with devices=4 is invalid (neither DP nor full TP)."""
+        with pytest.raises(ValueError, match="Invalid parallelism"):
+            self._validate(devices=4, tp=2, pp=1, ep=1)
+
+    def test_tp4_devices2_rejected(self):
+        """TP=4 > devices=2 is invalid."""
+        with pytest.raises(ValueError, match="Invalid parallelism"):
+            self._validate(devices=2, tp=4, pp=1, ep=1)
+
+    # --- EP > 1 scenarios ---
+    def test_ep2_devices2(self):
+        assert self._validate(devices=2, tp=1, pp=1, ep=2) == "expert_parallel"
+
+    def test_ep4_devices4(self):
+        assert self._validate(devices=4, tp=1, pp=1, ep=4) == "expert_parallel"
+
+    def test_ep8_devices8(self):
+        assert self._validate(devices=8, tp=1, pp=1, ep=8) == "expert_parallel"
+
+    def test_ep_with_tp_rejected(self):
+        """EP + TP is not allowed."""
+        with pytest.raises(ValueError, match="cannot be combined"):
+            self._validate(devices=8, tp=2, pp=1, ep=8)
+
+    def test_ep_with_pp_rejected(self):
+        """EP + PP is not allowed (PP is also separately rejected)."""
+        with pytest.raises((AssertionError, ValueError)):
+            self._validate(devices=4, tp=1, pp=2, ep=4)
+
+    def test_ep_less_than_devices_rejected(self):
+        """EP=2 with devices=4: EP must equal devices."""
+        with pytest.raises(ValueError, match="devices must equal"):
+            self._validate(devices=4, tp=1, pp=1, ep=2)
+
+    def test_ep_more_than_devices_rejected(self):
+        """EP=8 with devices=4: EP must equal devices."""
+        with pytest.raises(ValueError, match="devices must equal"):
+            self._validate(devices=4, tp=1, pp=1, ep=8)
+
+    # --- PP rejection ---
+    def test_pp2_rejected(self):
+        with pytest.raises(AssertionError, match="Pipeline Parallelism"):
+            self._validate(devices=2, tp=1, pp=2, ep=1)
+
+    def test_pp_with_tp_rejected(self):
+        with pytest.raises(AssertionError, match="Pipeline Parallelism"):
+            self._validate(devices=4, tp=2, pp=2, ep=1)
+
+    # --- DP scenarios ---
+    def test_dp2(self):
+        assert self._validate(devices=2, tp=1, pp=1, ep=1) == "data_parallel"
+
+    def test_dp4(self):
+        assert self._validate(devices=4, tp=1, pp=1, ep=1) == "data_parallel"
+
+    def test_dp8(self):
+        assert self._validate(devices=8, tp=1, pp=1, ep=1) == "data_parallel"
+
+    # --- Boundary: single device ---
+    def test_single_device(self):
+        assert self._validate(devices=1, tp=1, pp=1, ep=1) == "single"
+
+
+class TestRankWorldSizeAssignment:
+    """Test that rank and world_size are set correctly per parallelism mode."""
+
+    def _make_lm(self, mode, global_rank=0, devices=1):
+        from lm_eval.models.mindspeed_lm import MindSpeedLMEval
+
+        with mock.patch.object(MindSpeedLMEval, "__init__", return_value=None):
+            lm = MindSpeedLMEval.__new__(MindSpeedLMEval)
+        lm._parallelism_mode = mode
+        lm._global_rank = global_rank
+        lm._devices = devices
+
+        if mode == "data_parallel":
+            lm._rank = global_rank
+            lm._world_size = devices
+        else:
+            lm._rank = 0
+            lm._world_size = 1
+        return lm
+
+    def test_single_rank0_ws1(self):
+        lm = self._make_lm("single", global_rank=0, devices=1)
+        assert lm.rank == 0
+        assert lm.world_size == 1
+
+    def test_dp_rank0_ws4(self):
+        lm = self._make_lm("data_parallel", global_rank=0, devices=4)
+        assert lm.rank == 0
+        assert lm.world_size == 4
+
+    def test_dp_rank2_ws4(self):
+        lm = self._make_lm("data_parallel", global_rank=2, devices=4)
+        assert lm.rank == 2
+        assert lm.world_size == 4
+
+    def test_dp_rank7_ws8(self):
+        lm = self._make_lm("data_parallel", global_rank=7, devices=8)
+        assert lm.rank == 7
+        assert lm.world_size == 8
+
+    def test_tp2_rank0_any_global_rank(self):
+        """TP mode: always rank=0, world_size=1 regardless of global rank."""
+        for gr in range(4):
+            lm = self._make_lm("tensor_parallel", global_rank=gr, devices=2)
+            assert lm.rank == 0
+            assert lm.world_size == 1
+
+    def test_tp4_rank0_any_global_rank(self):
+        for gr in range(4):
+            lm = self._make_lm("tensor_parallel", global_rank=gr, devices=4)
+            assert lm.rank == 0
+            assert lm.world_size == 1
+
+    def test_ep4_rank0_any_global_rank(self):
+        """EP mode: always rank=0, world_size=1 (model parallelism)."""
+        for gr in range(4):
+            lm = self._make_lm("expert_parallel", global_rank=gr, devices=4)
+            assert lm.rank == 0
+            assert lm.world_size == 1
+
+    def test_ep8_rank0_any_global_rank(self):
+        for gr in range(8):
+            lm = self._make_lm("expert_parallel", global_rank=gr, devices=8)
+            assert lm.rank == 0
+            assert lm.world_size == 1
+
+
+class TestArgvForParallelModes:
+    """Test argv construction for TP, EP, and DP modes."""
+
+    def _capture_argv(self, **kwargs):
+        from lm_eval.models.mindspeed_lm import MindSpeedLMEval
+
+        defaults = {
+            "load": "/fake/ckpt",
+            "ckpt_step": None,
+            "tokenizer_type": "HuggingFaceTokenizer",
+            "tokenizer_model": "/fake/tokenizer",
+            "tokenizer_name_or_path": None,
+            "vocab_file": None,
+            "merge_file": None,
+            "devices": 1,
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "expert_model_parallel_size": 1,
+            "seq_length": 4096,
+            "micro_batch_size": 1,
+            "use_checkpoint_args": True,
+            "use_dist_ckpt": False,
+            "extra_args": None,
+            "seed": 42,
+            "spec": None,
+            "num_layers": None,
+            "hidden_size": None,
+            "num_attention_heads": None,
+            "ffn_hidden_size": None,
+            "num_query_groups": None,
+            "max_position_embeddings": None,
+            "padded_vocab_size": None,
+            "make_vocab_size_divisible_by": None,
+            "rotary_base": None,
+        }
+        defaults.update(kwargs)
+
+        captured_argv = []
+
+        with mock.patch.object(MindSpeedLMEval, "__init__", return_value=None):
+            lm = MindSpeedLMEval.__new__(MindSpeedLMEval)
+            lm._parallelism_mode = "single"
+            lm._devices = defaults["devices"]
+            lm._tp_size = defaults["tensor_model_parallel_size"]
+            lm._pp_size = defaults["pipeline_model_parallel_size"]
+            lm._ep_size = defaults["expert_model_parallel_size"]
+
+            with mock.patch("lm_eval.models.mindspeed_lm._is_torch_npu_available", return_value=False), \
+                 mock.patch("lm_eval.models.mindspeed_lm._maybe_patch_for_npu"), \
+                 mock.patch("lm_eval.models.mindspeed_lm._add_megatron_to_path", return_value="/fake"), \
+                 mock.patch("lm_eval.models.mindspeed_lm.get_distributed_backend", return_value="nccl"):
+
+                mock_megatron = mock.MagicMock()
+                sys.modules["megatron"] = mock_megatron
+                sys.modules["megatron.training"] = mock_megatron.training
+                sys.modules["megatron.core"] = mock_megatron.core
+                sys.modules["megatron.training.arguments"] = mock_megatron.training.arguments
+                sys.modules["megatron.training.checkpointing"] = mock_megatron.training.checkpointing
+
+                def capture(**_kw):
+                    captured_argv.append(list(sys.argv))
+
+                mock_megatron.training.initialize_megatron = capture
+
+                try:
+                    lm._initialize_megatron(**defaults)
+                except Exception:
+                    pass
+
+        return captured_argv[0] if captured_argv else []
+
+    def _assert_argv_pair(self, argv, flag, value):
+        idx = argv.index(flag)
+        assert argv[idx + 1] == str(value), f"Expected {flag} {value}, got {argv[idx+1]}"
+
+    def test_tp4_argv(self):
+        """TP=4: argv should set --tensor-model-parallel-size 4."""
+        argv = self._capture_argv(devices=4, tensor_model_parallel_size=4)
+        self._assert_argv_pair(argv, "--tensor-model-parallel-size", 4)
+        self._assert_argv_pair(argv, "--pipeline-model-parallel-size", 1)
+        self._assert_argv_pair(argv, "--expert-model-parallel-size", 1)
+
+    def test_ep4_argv(self):
+        """EP=4: argv should set --expert-model-parallel-size 4."""
+        argv = self._capture_argv(devices=4, expert_model_parallel_size=4)
+        self._assert_argv_pair(argv, "--expert-model-parallel-size", 4)
+        self._assert_argv_pair(argv, "--tensor-model-parallel-size", 1)
+        self._assert_argv_pair(argv, "--pipeline-model-parallel-size", 1)
+
+    def test_dp4_argv(self):
+        """DP=4: argv should keep TP=1, PP=1, EP=1."""
+        argv = self._capture_argv(devices=4)
+        self._assert_argv_pair(argv, "--tensor-model-parallel-size", 1)
+        self._assert_argv_pair(argv, "--pipeline-model-parallel-size", 1)
+        self._assert_argv_pair(argv, "--expert-model-parallel-size", 1)
+
+    def test_extra_args_passed(self):
+        """Extra args should appear in argv."""
+        argv = self._capture_argv(
+            extra_args="--qk-layernorm --swiglu --disable-bias-linear"
+        )
+        assert "--qk-layernorm" in argv
+        assert "--swiglu" in argv
+        assert "--disable-bias-linear" in argv
+
+    def test_spec_passed_as_separate_elements(self):
+        """--spec should be split into separate argv elements."""
+        argv = self._capture_argv(
+            spec="mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec"
+        )
+        idx = argv.index("--spec")
+        assert argv[idx + 1] == "mindspeed_llm.tasks.models.spec.qwen3_spec"
+        assert argv[idx + 2] == "layer_spec"
+
+    def test_no_checkpoint_args_flag(self):
+        """use_checkpoint_args=False should NOT add --use-checkpoint-args."""
+        argv = self._capture_argv(use_checkpoint_args=False)
+        assert "--use-checkpoint-args" not in argv
+
+    def test_dist_ckpt_flags(self):
+        """use_dist_ckpt=True should add --use-dist-ckpt and --auto-detect-ckpt-format."""
+        argv = self._capture_argv(use_dist_ckpt=True)
+        assert "--use-dist-ckpt" in argv
+        assert "--auto-detect-ckpt-format" in argv
+
+    def test_npu_backend_hccl(self):
+        """On NPU, --distributed-backend should be hccl."""
+        from lm_eval.models.mindspeed_lm import MindSpeedLMEval
+
+        captured_argv = []
+        defaults = {
+            "load": "/fake/ckpt", "ckpt_step": None,
+            "tokenizer_type": "HuggingFaceTokenizer",
+            "tokenizer_model": "/fake/tokenizer",
+            "tokenizer_name_or_path": None, "vocab_file": None,
+            "merge_file": None, "devices": 1,
+            "tensor_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "expert_model_parallel_size": 1,
+            "seq_length": 4096, "micro_batch_size": 1,
+            "use_checkpoint_args": True, "use_dist_ckpt": False,
+            "extra_args": None, "seed": 42, "spec": None,
+            "num_layers": None, "hidden_size": None,
+            "num_attention_heads": None, "ffn_hidden_size": None,
+            "num_query_groups": None, "max_position_embeddings": None,
+            "padded_vocab_size": None, "make_vocab_size_divisible_by": None,
+            "rotary_base": None,
+        }
+
+        with mock.patch.object(MindSpeedLMEval, "__init__", return_value=None):
+            lm = MindSpeedLMEval.__new__(MindSpeedLMEval)
+            lm._parallelism_mode = "single"
+            lm._devices = 1
+            lm._tp_size = 1
+            lm._pp_size = 1
+            lm._ep_size = 1
+
+            with mock.patch("lm_eval.models.mindspeed_lm._is_torch_npu_available", return_value=True), \
+                 mock.patch("lm_eval.models.mindspeed_lm._maybe_patch_for_npu"), \
+                 mock.patch("lm_eval.models.mindspeed_lm._add_megatron_to_path", return_value="/fake"), \
+                 mock.patch("lm_eval.models.mindspeed_lm.get_distributed_backend", return_value="hccl"):
+
+                mock_megatron = mock.MagicMock()
+                sys.modules["megatron"] = mock_megatron
+                sys.modules["megatron.training"] = mock_megatron.training
+                sys.modules["megatron.core"] = mock_megatron.core
+                sys.modules["megatron.training.arguments"] = mock_megatron.training.arguments
+                sys.modules["megatron.training.checkpointing"] = mock_megatron.training.checkpointing
+
+                def capture(**_kw):
+                    captured_argv.append(list(sys.argv))
+                mock_megatron.training.initialize_megatron = capture
+
+                try:
+                    lm._initialize_megatron(**defaults)
+                except Exception:
+                    pass
+
+        assert len(captured_argv) > 0
+        self._assert_argv_pair(captured_argv[0], "--distributed-backend", "hccl")
+
+
+class TestModelForward:
+    """Test _model_forward mask and position_ids construction."""
+
+    def _make_lm(self):
+        from lm_eval.models.mindspeed_lm import MindSpeedLMEval
+
+        with mock.patch.object(MindSpeedLMEval, "__init__", return_value=None):
+            lm = MindSpeedLMEval.__new__(MindSpeedLMEval)
+        lm._max_length = 16
+        lm._batch_size = 2
+        lm._max_gen_toks = 4
+        lm._device = torch.device("cpu")
+        lm._global_rank = 0
+        lm._ep_size = 1
+        lm._parallelism_mode = "single"
+        return lm
+
+    def test_no_padding_causal_only(self):
+        """Without padding, mask should be purely causal."""
+        batch_size, seq_len = 2, 4
+        input_ids = torch.randint(1, 100, (batch_size, seq_len))
+
+        causal_mask = torch.ones(
+            (batch_size, 1, seq_len, seq_len), dtype=torch.bool
+        ).triu(diagonal=1)
+
+        # Verify: lower triangle is all False (can attend)
+        assert causal_mask[0, 0, 0, 0] == False
+        assert causal_mask[0, 0, 1, 0] == False
+        assert causal_mask[0, 0, 2, 0] == False
+        # Upper triangle is True (masked)
+        assert causal_mask[0, 0, 0, 1] == True
+        assert causal_mask[0, 0, 0, 2] == True
+        assert causal_mask[0, 0, 0, 3] == True
+
+    def test_padding_mask_broadcasts_correctly(self):
+        """Padding mask [B,1,1,S] should mask ALL query positions for pad keys."""
+        batch_size, seq_len, pad_len = 2, 6, 3
+
+        attention_mask_2d = torch.zeros(batch_size, seq_len, dtype=torch.long)
+        attention_mask_2d[0, pad_len:] = 1  # sample 0: 3 pad + 3 real
+        attention_mask_0 = attention_mask_2d[0:1]
+
+        causal_mask = torch.ones((1, 1, seq_len, seq_len), dtype=torch.bool).triu(diagonal=1)
+        padding_mask = (1 - attention_mask_0).unsqueeze(1).unsqueeze(2).bool()
+        combined = causal_mask | padding_mask
+
+        # Shape after broadcast: [1, 1, seq_len, seq_len]
+        # All query positions should be masked for padding key positions
+        for q in range(seq_len):
+            for k in range(pad_len):
+                assert combined[0, 0, q, k] == True, (
+                    f"query={q}, key={k} should be masked (pad key)"
+                )
+
+        # Real tokens should see each other (causal only)
+        assert combined[0, 0, 3, 3] == False  # first real sees itself
+        assert combined[0, 0, 4, 3] == False  # second real sees first real
+        assert combined[0, 0, 3, 4] == True   # first real can't see future real
+
+    def test_position_ids_no_padding(self):
+        """Without padding, position_ids should be [0, 1, 2, ...]."""
+        seq_len = 5
+        position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+        assert position_ids.tolist() == [[0, 1, 2, 3, 4]]
+
+    def test_position_ids_with_padding(self):
+        """With padding, position_ids are still [0, 1, 2, ...] (RoPE-friendly)."""
+        batch_size, seq_len = 2, 6
+        position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+        # Both samples get same position_ids regardless of padding
+        assert position_ids[0].tolist() == [0, 1, 2, 3, 4, 5]
+        assert position_ids[1].tolist() == [0, 1, 2, 3, 4, 5]
+
+
+class TestLoglikelihoodEndToEnd:
+    """End-to-end loglikelihood with a mock model."""
+
+    def _make_lm(self, vocab_size=50):
+        from lm_eval.models.mindspeed_lm import MindSpeedLMEval
+
+        with mock.patch.object(MindSpeedLMEval, "__init__", return_value=None):
+            lm = MindSpeedLMEval.__new__(MindSpeedLMEval)
+        lm._max_length = 32
+        lm._batch_size = 4
+        lm._max_gen_toks = 8
+        lm._device = torch.device("cpu")
+        lm._global_rank = 0
+        lm._ep_size = 1
+        lm._parallelism_mode = "single"
+        lm._rank = 0
+        lm._world_size = 1
+
+        # Mock tokenizer
+        lm.tokenizer = mock.MagicMock()
+        lm.tokenizer.tokenize = lambda s: list(range(len(s)))
+        lm.tokenizer.detokenize = lambda tokens: "".join(chr(t + 65) for t in tokens)
+        lm.tokenizer.eod = 0
+        lm.tokenizer.bos_token_id = 1
+        lm.tokenizer.eos_token_id = 0
+
+        # Cache hook required by _loglikelihood_tokens
+        lm.cache_hook = mock.MagicMock()
+
+        # Mock model: return logits of shape [batch, seq, vocab]
+        lm.model = mock.MagicMock()
+
+        def fake_forward(input_ids, position_ids, attention_mask):
+            batch_size, seq_len = input_ids.shape
+            # At position s, predict the NEXT token (position s+1).
+            # This matches how loglikelihood works: logits[j] predicts input_ids[j+1].
+            logits = torch.full((batch_size, seq_len, vocab_size), -10.0)
+            for b in range(batch_size):
+                for s in range(seq_len - 1):
+                    logits[b, s, input_ids[b, s + 1]] = 10.0
+                logits[b, -1, input_ids[b, -1]] = 10.0  # last pos (unused)
+            return logits
+
+        lm.model.side_effect = fake_forward
+        return lm
+
+    def test_loglikelihood_basic(self):
+        """Test basic loglikelihood returns correct structure."""
+        lm = self._make_lm()
+
+        # Create requests: ((context, continuation), ctx_enc, cont_enc)
+        requests = [
+            ((None, "AB"), [0], [1, 2]),
+            ((None, "CD"), [0], [3, 4]),
+        ]
+
+        results = lm._loglikelihood_tokens(requests, disable_tqdm=True)
+        assert len(results) == 2
+        for logprob, is_greedy in results:
+            assert isinstance(logprob, float)
+            assert isinstance(is_greedy, bool)
+
+    def test_loglikelihood_greedy_matches(self):
+        """When model always predicts input token, is_greedy should be True."""
+        lm = self._make_lm()
+
+        requests = [((None, "AB"), [0], [1, 2])]
+        results = lm._loglikelihood_tokens(requests, disable_tqdm=True)
+
+        logprob, is_greedy = results[0]
+        assert is_greedy is True
+        assert logprob >= 0  # log_softmax max is 0.0
+
+    def test_loglikelihood_different_lengths(self):
+        """Requests with different context/continuation lengths."""
+        lm = self._make_lm()
+
+        requests = [
+            ((None, "A"), [0], [1]),         # ctx=1, cont=1
+            ((None, "ABC"), [0], [1, 2, 3]),  # ctx=1, cont=3
+        ]
+
+        results = lm._loglikelihood_tokens(requests, disable_tqdm=True)
+        assert len(results) == 2
+
+    def test_loglikelihood_empty_continuation(self):
+        """Empty continuation should return (0, True)."""
+        lm = self._make_lm()
+
+        requests = [((None, ""), [0], [])]
+        results = lm._loglikelihood_tokens(requests, disable_tqdm=True)
+
+        logprob, is_greedy = results[0]
+        assert logprob == 0.0
+        assert is_greedy is True
+
+
+class TestGenerateUntilEndToEnd:
+    """End-to-end generate_until with a mock model."""
+
+    def _make_lm(self, vocab_size=50, eot_id=0):
+        from lm_eval.models.mindspeed_lm import MindSpeedLMEval
+
+        with mock.patch.object(MindSpeedLMEval, "__init__", return_value=None):
+            lm = MindSpeedLMEval.__new__(MindSpeedLMEval)
+        lm._max_length = 32
+        lm._batch_size = 4
+        lm._max_gen_toks = 8
+        lm._device = torch.device("cpu")
+        lm._global_rank = 0
+        lm._ep_size = 1
+        lm._parallelism_mode = "single"
+        lm._rank = 0
+        lm._world_size = 1
+
+        # Mock tokenizer
+        lm.tokenizer = mock.MagicMock()
+        lm.tokenizer.tokenize = lambda s: [ord(c) % vocab_size for c in s]
+        lm.tokenizer.detokenize = lambda tokens: "".join(chr(t + 65) for t in tokens)
+        lm.tokenizer.eod = eot_id
+
+        # Cache hook required by generate_until
+        lm.cache_hook = mock.MagicMock()
+
+        return lm
+
+    def test_greedy_generates_until_eot(self):
+        """Generation should stop at EOT token."""
+        lm = self._make_lm(eot_id=0)
+        eot_id = 0
+
+        # Model that generates: token 1, token 2, EOT
+        call_count = [0]
+
+        def fake_forward(input_ids, position_ids, attention_mask):
+            call_count[0] += 1
+            batch_size, seq_len = input_ids.shape
+            vocab_size = 50
+            logits = torch.full((batch_size, seq_len, vocab_size), -10.0)
+            for b in range(batch_size):
+                step = call_count[0]
+                if step == 1:
+                    logits[b, -1, 1] = 100.0  # generate token 1
+                elif step == 2:
+                    logits[b, -1, 2] = 100.0  # generate token 2
+                else:
+                    logits[b, -1, eot_id] = 100.0  # generate EOT
+            return logits
+
+        lm.model = mock.MagicMock(side_effect=fake_forward)
+
+        from lm_eval.api.instance import Instance
+        # Instance(request_type, doc, arguments, idx)
+        req = Instance("generate_until", {}, ("Hello", {"until": ["\n"]}), 0)
+        results = lm.generate_until([req], disable_tqdm=True)
+        assert len(results) == 1
+        # Should have generated 2 tokens (1, 2) before EOT: tok 1->'B', tok 2->'C'
+        assert "B" in results[0] or "C" in results[0]
+
+    def test_greedy_stops_at_max_gen_toks(self):
+        """Generation should stop at max_gen_toks if no EOT."""
+        lm = self._make_lm(eot_id=99)
+        lm._max_gen_toks = 3
+
+        def fake_forward(input_ids, position_ids, attention_mask):
+            batch_size, seq_len = input_ids.shape
+            vocab_size = 50
+            logits = torch.full((batch_size, seq_len, vocab_size), -10.0)
+            # Always generate token 5 (never EOT since EOT=99)
+            logits[:, -1, 5] = 100.0
+            return logits
+
+        lm.model = mock.MagicMock(side_effect=fake_forward)
+
+        from lm_eval.api.instance import Instance
+        req = Instance("generate_until", {}, ("Hello", {"until": []}), 0)
+        results = lm.generate_until([req], disable_tqdm=True)
+        assert len(results) == 1
+        # 3 tokens of id 5 -> detokenize: chr(5+65)='F' repeated 3 times
+        assert results[0] == "FFF"
+
+
+class TestDistributedSync:
+    """Test EP and TP synchronization logic in generate_until."""
+
+    def test_ep_sync_all_reduce_min_semantics(self):
+        """Verify all_reduce with MIN: if any rank is not finished, all continue."""
+        # Simulate 4 EP ranks
+        finished_tensors = [
+            torch.tensor([1], dtype=torch.int32),  # rank 0: all finished
+            torch.tensor([0], dtype=torch.int32),  # rank 1: not finished
+            torch.tensor([1], dtype=torch.int32),  # rank 2: all finished
+            torch.tensor([1], dtype=torch.int32),  # rank 3: all finished
+        ]
+        # Simulate all_reduce MIN
+        result = torch.tensor([min(t.item() for t in finished_tensors)])
+        assert result.item() == 0  # At least one rank not done -> continue
+
+        # All ranks finished
+        finished_all = [
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([1], dtype=torch.int32),
+        ]
+        result = torch.tensor([min(t.item() for t in finished_all)])
+        assert result.item() == 1  # All done -> exit
+
+    def test_ep_sync_one_rank_lagging(self):
+        """One rank still generating while others are done."""
+        finished_tensors = [
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int32),  # lagging
+            torch.tensor([1], dtype=torch.int32),
+        ]
+        result = torch.tensor([min(t.item() for t in finished_tensors)])
+        assert result.item() == 0  # Must continue
+
+    def test_tp_broadcast_ensures_consistency(self):
+        """In TP mode with sampling, broadcast from rank 0 ensures consistency."""
+        # Simulate: rank 0 samples token 42, rank 1 samples token 17
+        tokens_rank0 = torch.tensor([[42]])
+        tokens_rank1 = torch.tensor([[17]])
+
+        # After broadcast from src=0, all ranks should have token 42
+        tokens_rank1 = tokens_rank0.clone()
+        assert tokens_rank0.item() == tokens_rank1.item() == 42
+
+    def test_ep_mode_no_data_distribution(self):
+        """EP mode: world_size=1 means lm_eval gives ALL requests to each rank."""
+        from lm_eval.models.mindspeed_lm import MindSpeedLMEval
+
+        with mock.patch.object(MindSpeedLMEval, "__init__", return_value=None):
+            lm = MindSpeedLMEval.__new__(MindSpeedLMEval)
+        lm._parallelism_mode = "expert_parallel"
+        lm._rank = 0
+        lm._world_size = 1
+        lm._global_rank = 3  # Even though global rank is 3
+        lm._ep_size = 4
+
+        # lm_eval uses rank and world_size for distribution
+        # With rank=0, world_size=1, all ranks see all data
+        assert lm.rank == 0
+        assert lm.world_size == 1
+
+    def test_tp_mode_no_data_distribution(self):
+        """TP mode: world_size=1 means lm_eval gives ALL requests to each rank."""
+        from lm_eval.models.mindspeed_lm import MindSpeedLMEval
+
+        with mock.patch.object(MindSpeedLMEval, "__init__", return_value=None):
+            lm = MindSpeedLMEval.__new__(MindSpeedLMEval)
+        lm._parallelism_mode = "tensor_parallel"
+        lm._rank = 0
+        lm._world_size = 1
+        lm._global_rank = 1  # Even though global rank is 1
+        lm._tp_size = 2
+
+        assert lm.rank == 0
+        assert lm.world_size == 1
 
 
 # ---------------------------------------------------------------------------

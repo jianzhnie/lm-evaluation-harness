@@ -428,16 +428,18 @@ class MindSpeedLMEval(LM):
 
     def _validate_parallelism_config(self, devices: int, tp: int, pp: int, ep: int):
         """
-        Validate parallelism configuration (NeMo-style).
+        Validate parallelism configuration.
 
         Supported modes:
-        1. Data Parallelism: tp=1, pp=1, devices>1 (with optional EP)
-        2. Tensor Parallelism: tp == devices, pp=1
-        3. Single GPU: devices=1
+        1. Single GPU: devices=1, TP=1, PP=1, EP=1
+        2. Data Parallelism: tp=1, pp=1, devices>1
+        3. Tensor Parallelism: tp == devices, pp=1
+        4. Expert Parallelism (MoE): ep == devices, tp=1, pp=1
 
         For Expert Parallelism (EP > 1):
         - EP cannot be combined with TP or PP (must have TP=1, PP=1)
-        - EP must equal devices (each expert parallel rank is also a data parallel rank)
+        - EP must equal devices (all ranks form one model-parallel group)
+        - EP is model parallelism (world_size=1), not data parallelism
 
         Note: Pipeline Parallelism (PP > 1) is NOT currently supported.
         """
@@ -464,20 +466,23 @@ class MindSpeedLMEval(LM):
                 )
 
         # At this point, pp == 1 is guaranteed (pp > 1 was rejected above)
-        if tp == 1:
+        if ep > 1:
+            # Expert Parallelism: all ranks form one model-parallel group
+            # (each rank holds different MoE experts; all-to-all communication
+            # requires all ranks to participate in every forward pass).
+            self._parallelism_mode = "expert_parallel"
+            eval_logger.info(
+                f"Parallelism mode: Expert Parallel (EP={ep}, devices={devices})"
+            )
+        elif tp == 1:
             if devices == 1:
                 self._parallelism_mode = "single"
                 eval_logger.info("Parallelism mode: Single GPU")
             else:
                 self._parallelism_mode = "data_parallel"
-                if ep > 1:
-                    eval_logger.info(
-                        f"Parallelism mode: Data Parallel with EP={ep} (devices={devices})"
-                    )
-                else:
-                    eval_logger.info(
-                        f"Parallelism mode: Data Parallel with {devices} replicas"
-                    )
+                eval_logger.info(
+                    f"Parallelism mode: Data Parallel with {devices} replicas"
+                )
         elif tp == devices:
             self._parallelism_mode = "tensor_parallel"
             eval_logger.info(f"Parallelism mode: Tensor Parallel (TP={tp})")
@@ -511,15 +516,16 @@ class MindSpeedLMEval(LM):
         # import so that MindSpeed-LLM's CUDA/NCCL hardcodes work on Ascend NPU.
         _maybe_patch_for_npu()
 
-        # When MindSpeed-LLM is available on NPU, import megatron_adaptor which triggers
-        # torch_npu.contrib.transfer_to_npu for comprehensive CUDA->NPU redirect.
+        # Always try to load MindSpeed-LLM's megatron_adaptor when available.
+        # It patches Megatron modules with MindSpeed-LLM's enhanced versions
+        # (custom GPTModel forward features, model specs, etc.) needed by models
+        # like Qwen3, DeepSeek, etc.  On NPU it also handles CUDA->NPU redirect.
         # This must happen BEFORE any Megatron module imports.
-        if _is_torch_npu_available():
-            try:
-                from mindspeed_llm import megatron_adaptor  # noqa: F401
-                eval_logger.info("MindSpeed-LLM megatron_adaptor loaded (transfer_to_npu active)")
-            except ImportError:
-                eval_logger.info("mindspeed_llm not found; using base Megatron-LM with manual NPU patches")
+        try:
+            from mindspeed_llm import megatron_adaptor  # noqa: F401
+            eval_logger.info("MindSpeed-LLM megatron_adaptor loaded")
+        except ImportError:
+            eval_logger.info("mindspeed_llm not found; using base Megatron-LM")
 
         from megatron.training import (
             get_args,
@@ -692,9 +698,11 @@ class MindSpeedLMEval(LM):
                 self._rank = self._global_rank
                 self._world_size = devices
             else:
-                # Model Parallelism (TP/PP): all ranks work together as a single logical worker
+                # Model Parallelism (TP/EP): all ranks work together as a single logical worker.
                 # From lm_eval's perspective, this is a single worker (world_size=1)
-                # because TP/PP handles computation distribution, not data distribution
+                # because TP/EP handles computation distribution, not data distribution.
+                # All ranks must process the same requests so they stay in sync
+                # (TP all-reduce, EP all-to-all).
                 self._rank = 0
                 self._world_size = 1
 
@@ -1182,7 +1190,7 @@ class MindSpeedLMEval(LM):
 
         With Expert Parallelism (EP > 1):
         - MoE layers use all-to-all which provides implicit synchronization
-        - lm_eval's evaluator ensures equal request counts across ranks
+        - All EP ranks process identical requests (world_size=1, model parallelism)
         """
         # Distribute requests for Data Parallelism
         local_requests, sizes = self._distribute_requests(requests)
