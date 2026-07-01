@@ -18,7 +18,9 @@
 #   SPEC                 - Custom layer spec module path (optional)
 #   EXTRA_ARGS           - Extra Megatron-LM arguments (optional)
 # =============================================================================
-source ~/.bashrc
+source /home/jianzhnie/llmtuner/llm/lm-evaluation-harness/set_env.sh 2>/dev/null
+# Ensure lm_eval is importable from the source directory
+export PYTHONPATH="/home/jianzhnie/llmtuner/llm/lm-evaluation-harness:${PYTHONPATH:-}"
 cd /home/jianzhnie/llmtuner/llm/MindSpeed-LLM
 
 # ----- Edit these paths to match your environment -----
@@ -37,9 +39,9 @@ export TOKENIZER_MODEL
 
 # ----- Model & evaluation config -----
 export TASKS="${TASKS:-hellaswag}"
-export TP_SIZE="${TP_SIZE:-1}"
+export TP_SIZE="${TP_SIZE:-4}"
 export PP_SIZE="${PP_SIZE:-1}"
-export NUM_DEVICES="${NUM_DEVICES:-1}"
+export NUM_DEVICES="${NUM_DEVICES:-4}"
 export SEQ_LENGTH="${SEQ_LENGTH:-4096}"
 export BATCH_SIZE="${BATCH_SIZE:-8}"
 export MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
@@ -48,13 +50,13 @@ export OUTPUT_PATH="${OUTPUT_PATH:-results/eval}"
 
 # ----- Tokenizer config -----
 # For PretrainedFromHF tokenizer type, uncomment and set:
-# export TOKENIZER_TYPE="PretrainedFromHF"
-# export TOKENIZER_NAME_OR_PATH="/path/to/tokenizer"
+export TOKENIZER_TYPE="PretrainedFromHF"
+export TOKENIZER_NAME_OR_PATH="${TOKENIZER_MODEL}"
 
 # ----- Optional: Custom layer spec -----
 # Uncomment for specific models:
 # Qwen3:
-# export SPEC="mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec"
+export SPEC="mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec"
 # Qwen2 MoE:
 # export SPEC="mindspeed_llm.tasks.models.spec.qwen2_moe_spec layer_spec"
 
@@ -65,7 +67,11 @@ export OUTPUT_PATH="${OUTPUT_PATH:-results/eval}"
 # export EXTRA_ARGS="--qk-layernorm --use-rotary-position-embeddings --swiglu --disable-bias-linear --group-query-attention --num-query-groups 8 --kv-channels 128 --normalization RMSNorm --position-embedding-type rope --norm-epsilon 1e-6 --padded-vocab-size 151936 --make-vocab-size-divisible-by 1 --rotary-base 1000000 --num-layers 28 --hidden-size 1024 --num-attention-heads 16 --ffn-hidden-size 3072"
 
 # Qwen3-8B (with use_checkpoint_args=true, mcore checkpoint):
-# export EXTRA_ARGS="--qk-layernorm --use-rotary-position-embeddings --swiglu --disable-bias-linear --group-query-attention --num-query-groups 8 --kv-channels 128 --normalization RMSNorm --position-embedding-type rope --norm-epsilon 1e-6"
+# NOTE: --no-rope-fusion and --no-persist-layer-norm are required when
+# mindspeed_llm is not available (no Apex/TE installed on NPU).
+# --ffn-hidden-size 12288 and --make-vocab-size-divisible-by 1 are required
+# to match the checkpoint (prevent auto-computation and vocab padding).
+export EXTRA_ARGS="--qk-layernorm --no-rope-fusion --no-persist-layer-norm --use-rotary-position-embeddings --swiglu --disable-bias-linear --group-query-attention --num-query-groups 8 --kv-channels 128 --normalization RMSNorm --position-embedding-type rope --norm-epsilon 1e-6 --transformer-impl local --ffn-hidden-size 12288 --make-vocab-size-divisible-by 1"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 

@@ -277,12 +277,12 @@ run_custom() {
 
     # Custom layer spec for model architectures (e.g., Qwen3)
     if [ -n "${SPEC:-}" ]; then
-        model_args="${model_args},spec=\"${SPEC}\""
+        model_args="${model_args},spec=${SPEC}"
         log_info "  spec=${SPEC}"
     fi
 
     if [ -n "${EXTRA_ARGS:-}" ]; then
-        model_args="${model_args},extra_args=\"${EXTRA_ARGS}\""
+        model_args="${model_args},extra_args=${EXTRA_ARGS}"
         log_info "  extra_args=${EXTRA_ARGS}"
     fi
 

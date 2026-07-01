@@ -60,7 +60,7 @@ Usage Examples:
         --tasks arc_easy --batch_size 8
 """
 
-import json
+import importlib
 import logging
 import os
 import sys
@@ -73,9 +73,8 @@ from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from lm_eval.device import (
-    get_current_device,
-    get_distributed_backend,
     _is_torch_npu_available,
+    get_current_device,
 )
 from lm_eval.models.utils import Collator
 from lm_eval.utils import get_rolling_token_windows, make_disjoint_window
@@ -103,137 +102,113 @@ def _add_megatron_to_path():
     return megatron_path
 
 
-def _maybe_patch_for_npu():
-    """Monkey-patch CUDA APIs to NPU equivalents for Ascend compatibility.
+class AscendNPUPatch:
+    """NPU (Ascend) compatibility layer for Megatron-LM.
 
-    MindSpeed-LLM (Megatron-LM fork for Ascend NPU) hardcodes CUDA/NCCL
-    internally. Some torch_npu versions do NOT automatically monkey-patch
-    all torch.cuda APIs, causing failures on NPU-only machines.
-
-    This function patches:
-    1. torch.cuda APIs (is_available, device_count, set_device, etc.)
-    2. torch.distributed.init_process_group backend ('nccl' -> 'hccl')
-
-    These patches are applied only when NPU is available and CUDA is not,
-    and only affect the current process.
+    Consolidates all NPU-specific monkey-patches and workarounds needed
+    to run Megatron-LM on Ascend hardware without full MindSpeed-LLM stack.
     """
-    try:
-        import torch_npu  # noqa: F401
-    except ImportError:
-        return
 
-    if not torch.npu.is_available():
-        return
+    @staticmethod
+    def is_available() -> bool:
+        return _is_torch_npu_available()
 
-    cuda_available = torch.cuda.is_available()
+    @staticmethod
+    def apply():
+        """Apply all NPU patches before any Megatron imports."""
+        if not AscendNPUPatch.is_available():
+            return
 
-    if not cuda_available:
+        AscendNPUPatch._patch_cuda_apis()
+        AscendNPUPatch._patch_dist_backend()
+        AscendNPUPatch._init_default_generators()
+
+    @staticmethod
+    def _patch_cuda_apis():
+        """Map torch.cuda.* to torch.npu.* for Megatron compatibility."""
+        if torch.cuda.is_available():
+            return
+
         eval_logger.info(
-            "NPU detected but torch.cuda.is_available() is False. "
-            "Monkey-patching torch.cuda APIs to torch.npu equivalents for Megatron compatibility."
+            "NPU detected (CUDA unavailable). "
+            "Patching torch.cuda APIs to torch.npu equivalents."
         )
-
-        # Map torch.cuda -> torch.npu for APIs used by MindSpeed-LLM
-        _CUDA_TO_NPU_MAP = {
-            "is_available": torch.npu.is_available,
-            "device_count": torch.npu.device_count,
-            "set_device": torch.npu.set_device,
-            "current_device": torch.npu.current_device,
-        }
-        for attr, npu_fn in _CUDA_TO_NPU_MAP.items():
-            if not hasattr(torch.cuda, attr) or getattr(torch.cuda, attr) is npu_fn:
-                continue
-            setattr(torch.cuda, attr, npu_fn)
-
-        # Patch torch.cuda.Stream and set_stream if external_cuda_graph is ever used
+        # Core API replacements
+        for attr in ("is_available", "device_count", "set_device", "current_device"):
+            if hasattr(torch.npu, attr) and not hasattr(torch.cuda, attr):
+                setattr(torch.cuda, attr, getattr(torch.npu, attr))
+        # CUDA Stream/Graph APIs (some Megatron branches may reference)
         if hasattr(torch.npu, "Stream") and not hasattr(torch.cuda, "Stream"):
             torch.cuda.Stream = torch.npu.Stream
-        if hasattr(torch.npu, "set_stream") and getattr(torch.cuda, "set_stream", None) is not torch.npu.set_stream:
+        if hasattr(torch.npu, "set_stream"):
             torch.cuda.set_stream = torch.npu.set_stream
 
-    # MindSpeed-LLM's argparse only accepts 'nccl'/'gloo' for --distributed-backend,
-    # but NPU requires 'hccl'. Patch init_process_group to transparently redirect.
-    _orig_init_pg = torch.distributed.init_process_group
+    @staticmethod
+    def _patch_dist_backend():
+        """Redirect distributed backend nccl -> hccl for NPU."""
+        _orig_init_pg = torch.distributed.init_process_group
 
-    def _patched_init_process_group(*args, **kwargs):
-        backend = kwargs.get("backend") or (args[0] if args else None)
-        if backend == "nccl":
-            eval_logger.debug("Redirecting distributed backend 'nccl' -> 'hccl' for NPU compatibility")
-            if "backend" in kwargs:
-                kwargs["backend"] = "hccl"
-            elif args:
-                args = ("hccl",) + args[1:]
-        return _orig_init_pg(*args, **kwargs)
+        def _patched_init_process_group(*args, **kwargs):
+            backend = kwargs.get("backend") or (args[0] if args else None)
+            if backend == "nccl":
+                if "backend" in kwargs:
+                    kwargs["backend"] = "hccl"
+                elif args:
+                    args = ("hccl",) + args[1:]
+            return _orig_init_pg(*args, **kwargs)
 
-    if torch.distributed.init_process_group is not _patched_init_process_group:
-        torch.distributed.init_process_group = _patched_init_process_group
+        if torch.distributed.init_process_group is not _patched_init_process_group:
+            torch.distributed.init_process_group = _patched_init_process_group
 
+    @staticmethod
+    def _init_default_generators():
+        """Initialize torch.cuda.default_generators for Megatron random.py."""
+        n_devices = torch.npu.device_count()
+        if not torch.cuda.default_generators and n_devices > 0:
+            torch.cuda.default_generators = tuple(
+                torch.Generator(device="npu") for _ in range(n_devices)
+            )
+            eval_logger.info(
+                f"Initialized {n_devices} NPU default generators"
+            )
 
-def _try_load_hf_config_as_mcore_args(
-    tokenizer_model: str | None,
-    tokenizer_name_or_path: str | None = None,
-) -> dict[str, int]:
-    """Try to load HF config.json and map to Megatron model arguments.
+    @staticmethod
+    def patch_compile_dependencies():
+        """Patch _compile_dependencies to no-op on NPU (no CUDA nvcc)."""
+        try:
+            import megatron.training.initialize as megatron_init
+            if hasattr(megatron_init, "_compile_dependencies"):
+                megatron_init._compile_dependencies = lambda: None
+                eval_logger.info("NPU: _compile_dependencies patched to no-op")
+        except ImportError:
+            pass
 
-    When use_checkpoint_args=False, we need to provide model architecture args
-    (num-layers, hidden-size, etc.) manually. This helper auto-detects them from
-    a nearby HF config.json (e.g. in the tokenizer_model directory or its parent).
+    @staticmethod
+    def load_mindspeed_adaptor():
+        """Try loading MindSpeed-LLM megatron_adaptor. Returns True if loaded."""
+        if not AscendNPUPatch.is_available():
+            return False
+        try:
+            from mindspeed_llm import megatron_adaptor  # noqa: F401
+            eval_logger.info("MindSpeed-LLM megatron_adaptor loaded")
+            return True
+        except ImportError:
+            eval_logger.info("mindspeed_llm not available; using manual NPU patches")
+            return False
 
-    Returns a dict of kwargs that can be passed to _initialize_megatron.
-    """
-    # Possible locations for config.json
-    candidate_dirs = []
-    for path in (tokenizer_model, tokenizer_name_or_path):
-        if path is not None and os.path.isdir(path):
-            candidate_dirs.append(path)
-            candidate_dirs.append(os.path.dirname(path))
-    # Deduplicate while preserving order
-    seen = set()
-    unique_dirs = []
-    for d in candidate_dirs:
-        if d not in seen:
-            seen.add(d)
-            unique_dirs.append(d)
-    candidate_dirs = unique_dirs
+    @staticmethod
+    def get_tokenizer_fallback(tokenizer_type):
+        """Fall back tokenizer type and args when mindspeed_llm missing.
 
-    if not candidate_dirs:
-        return {}
-
-    config_path = None
-    for d in candidate_dirs:
-        if d and os.path.isdir(d):
-            p = os.path.join(d, "config.json")
-            if os.path.isfile(p):
-                config_path = p
-                break
-
-    if config_path is None:
-        return {}
-
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    except Exception as e:
-        eval_logger.warning(f"Failed to load HF config from {config_path}: {e}")
-        return {}
-
-    mapping = {}
-    if "num_hidden_layers" in config:
-        mapping["num_layers"] = config["num_hidden_layers"]
-    if "hidden_size" in config:
-        mapping["hidden_size"] = config["hidden_size"]
-    if "num_attention_heads" in config:
-        mapping["num_attention_heads"] = config["num_attention_heads"]
-    if "num_key_value_heads" in config:
-        mapping["num_query_groups"] = config["num_key_value_heads"]
-    if "intermediate_size" in config:
-        mapping["ffn_hidden_size"] = config["intermediate_size"]
-    if "max_position_embeddings" in config:
-        mapping["max_position_embeddings"] = config["max_position_embeddings"]
-
-    if mapping:
-        eval_logger.info(f"Auto-detected model args from {config_path}: {mapping}")
-    return mapping
+        Returns (tokenizer_type, tokenizer_model_override).
+        """
+        if tokenizer_type == "PretrainedFromHF":
+            eval_logger.info(
+                "mindspeed_llm not available: falling back "
+                "PretrainedFromHF -> HuggingFaceTokenizer"
+            )
+            return "HuggingFaceTokenizer", None
+        return tokenizer_type, None
 
 
 def _check_dist_ckpt(load_path: str) -> bool:
@@ -495,82 +470,61 @@ class MindSpeedLMEval(LM):
 
     def _initialize_megatron(self, **kwargs):
         """Initialize Megatron distributed environment and load model."""
-        # Avoid torch.compile/inductor runtime failures when torch/triton versions are mismatched.
-        # Users can still override these env vars externally before launch if needed.
         os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
         os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
 
-        # Set distributed backend for NPU (HCCL) if available
-        if _is_torch_npu_available():
+        # NPU environment setup
+        if AscendNPUPatch.is_available():
             os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
             os.environ.setdefault("MASTER_PORT", "29500")
 
-        # MindSpeed-LLM requires CUDA_DEVICE_MAX_CONNECTIONS=1 when using
-        # tensor parallelism or context parallelism. On NPU this env var is
-        # still respected by the compatibility layer, so set it proactively.
         _tp_for_env = kwargs.get("tensor_model_parallel_size", 1)
         if _tp_for_env > 1:
             os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
 
-        # Patch torch.cuda -> torch.npu and distributed backend BEFORE any megatron
-        # import so that MindSpeed-LLM's CUDA/NCCL hardcodes work on Ascend NPU.
-        _maybe_patch_for_npu()
+        # Apply NPU patches + try loading MindSpeed-LLM adaptor
+        AscendNPUPatch.apply()
+        mindspeed_available = AscendNPUPatch.load_mindspeed_adaptor()
 
-        # Always try to load MindSpeed-LLM's megatron_adaptor when available.
-        # It patches Megatron modules with MindSpeed-LLM's enhanced versions
-        # (custom GPTModel forward features, model specs, etc.) needed by models
-        # like Qwen3, DeepSeek, etc.  On NPU it also handles CUDA->NPU redirect.
-        # This must happen BEFORE any Megatron module imports.
-        try:
-            from mindspeed_llm import megatron_adaptor  # noqa: F401
-            eval_logger.info("MindSpeed-LLM megatron_adaptor loaded")
-        except ImportError:
-            eval_logger.info("mindspeed_llm not found; using base Megatron-LM")
+        # Tokenizer fallback when mindspeed_llm not available
+        saved_tokenizer_type, _ = AscendNPUPatch.get_tokenizer_fallback(kwargs["tokenizer_type"])
+        if saved_tokenizer_type != kwargs["tokenizer_type"]:
+            kwargs["tokenizer_type"] = saved_tokenizer_type
+            if not kwargs.get("tokenizer_model") and kwargs.get("tokenizer_name_or_path"):
+                kwargs["tokenizer_model"] = kwargs["tokenizer_name_or_path"]
 
-        from megatron.training import (
-            get_args,
-            get_model,
-            get_tokenizer,
-        )
+        # Import Megatron
+        from megatron.training import get_args, get_model, get_tokenizer
         from megatron.training.arguments import core_transformer_config_from_args
         from megatron.training.checkpointing import load_checkpoint
 
-        # Use MindSpeed-LLM's initialize_megatron when available (adds NPU
-        # support via allow_no_cuda).  Fall back to base Megatron-LM's version
-        # if torch_npu / mindspeed_llm is not installed (e.g. CUDA-only host).
         try:
             from mindspeed_llm.training.initialize import initialize_megatron
         except ImportError:
             from megatron.training import initialize_megatron
 
+        # Patch compile dependencies on NPU
+        if not mindspeed_available:
+            AscendNPUPatch.patch_compile_dependencies()
+
         devices = kwargs["devices"]
         tp_size = kwargs["tensor_model_parallel_size"]
         pp_size = kwargs["pipeline_model_parallel_size"]
         ep_size = kwargs["expert_model_parallel_size"]
-
-        # For Data Parallelism mode, we use TP=1, PP=1 for each replica
-        # The data distribution is handled in _loglikelihood_tokens
         actual_tp = tp_size
         actual_pp = pp_size
 
-        # Build command line arguments
+        # Build command line arguments (align with megatron_lm.py)
         argv = [
             sys.argv[0],
-            "--load",
-            kwargs["load"],
-            "--tensor-model-parallel-size",
-            str(actual_tp),
-            "--pipeline-model-parallel-size",
-            str(actual_pp),
-            "--expert-model-parallel-size",
-            str(ep_size),
-            "--seq-length",
-            str(kwargs["seq_length"]),
-            "--tokenizer-type",
-            kwargs["tokenizer_type"],
+            "--load", kwargs["load"],
+            "--tensor-model-parallel-size", str(actual_tp),
+            "--pipeline-model-parallel-size", str(actual_pp),
+            "--expert-model-parallel-size", str(ep_size),
+            "--seq-length", str(kwargs["seq_length"]),
+            "--tokenizer-type", kwargs["tokenizer_type"],
             "--use-mcore-models",
-            "--no-load-optim",
-            "--no-load-rng",
+            "--no-load-optim", "--no-load-rng",
             "--bf16",
             "--no-masked-softmax-fusion",
             "--no-bias-gelu-fusion",
@@ -578,21 +532,13 @@ class MindSpeedLMEval(LM):
             "--no-gradient-accumulation-fusion",
             "--attention-softmax-in-fp32",
             "--exit-on-missing-checkpoint",
-            "--hidden-dropout",
-            "0",
-            "--attention-dropout",
-            "0",
-            "--seed",
-            str(kwargs.get("seed", 42)),
+            "--hidden-dropout", "0",
+            "--attention-dropout", "0",
+            "--seed", str(kwargs.get("seed", 42)),
         ]
-
-        # Set distributed backend based on device type (auto-detected via device.py)
-        # CUDA -> nccl, NPU -> hccl, XPU -> ccl, etc.
-        argv.extend(["--distributed-backend", get_distributed_backend()])
 
         argv.extend(["--micro-batch-size", str(kwargs["micro_batch_size"])])
 
-        # Add ckpt_step if specified
         if kwargs.get("ckpt_step") is not None:
             argv.extend(["--ckpt-step", str(kwargs["ckpt_step"])])
 
@@ -600,50 +546,52 @@ class MindSpeedLMEval(LM):
             argv.append("--use-dist-ckpt")
             argv.append("--auto-detect-ckpt-format")
 
-        # Custom layer spec (e.g. "mindspeed_llm.tasks.models.spec.qwen3_spec layer_spec")
-        # --spec uses nargs='+' in Megatron argparse, so we must split into separate argv elements
-        if kwargs.get("spec"):
-            argv.extend(["--spec"] + kwargs["spec"].split())
+        # Spec: validate import before passing to Megatron
+        spec_arg = kwargs.get("spec")
+        if spec_arg:
+            spec_parts = spec_arg.split()
+            try:
+                importlib.import_module(spec_parts[0])
+                argv.extend(["--spec"] + spec_parts)
+                eval_logger.info(f"Using custom layer spec: {spec_arg}")
+            except ImportError:
+                eval_logger.warning(
+                    f"Cannot import spec '{spec_parts[0]}'; "
+                    f"falling back to built-in layer spec"
+                )
 
         if kwargs.get("tokenizer_model"):
             argv.extend(["--tokenizer-model", kwargs["tokenizer_model"]])
-        if kwargs.get("tokenizer_name_or_path"):
+        if mindspeed_available and kwargs.get("tokenizer_name_or_path"):
             argv.extend(["--tokenizer-name-or-path", kwargs["tokenizer_name_or_path"]])
         if kwargs.get("vocab_file"):
             argv.extend(["--vocab-file", kwargs["vocab_file"]])
         if kwargs.get("merge_file"):
             argv.extend(["--merge-file", kwargs["merge_file"]])
 
-        # Use checkpoint args unless explicitly disabled.
-        # When disabled, model architecture args must come from kwargs or HF config auto-detection.
-        use_checkpoint_args = kwargs.get("use_checkpoint_args", True)
-        if use_checkpoint_args:
-            argv.append("--use-checkpoint-args")
-        else:
-            eval_logger.info("use_checkpoint_args=False; loading model architecture from kwargs/HF config")
-            auto_args = _try_load_hf_config_as_mcore_args(
-                kwargs.get("tokenizer_model"),
-                kwargs.get("tokenizer_name_or_path"),
-            )
-            # Kwargs take precedence over auto-detected values
-            for key in ("num_layers", "hidden_size", "num_attention_heads", "ffn_hidden_size", "num_query_groups", "max_position_embeddings"):
-                val = kwargs.get(key)
-                if val is None and key in auto_args:
-                    val = auto_args[key]
-                if val is not None:
-                    arg_name = key.replace("_", "-")
-                    argv.extend([f"--{arg_name}", str(val)])
+        # Use checkpoint args (same as megatron_lm.py)
+        argv.append("--use-checkpoint-args")
 
-        # Architecture args that may be needed even with use_checkpoint_args
-        # (these are not always stored in checkpoints)
-        if kwargs.get("padded_vocab_size") is not None:
-            argv.extend(["--padded-vocab-size", str(kwargs["padded_vocab_size"])])
-        if kwargs.get("make_vocab_size_divisible_by") is not None:
-            argv.extend(["--make-vocab-size-divisible-by", str(kwargs["make_vocab_size_divisible_by"])])
-        if kwargs.get("rotary_base") is not None:
-            argv.extend(["--rotary-base", str(kwargs["rotary_base"])])
+        # Monkey-patch load_args_from_checkpoint to preserve tokenizer settings
+        # when mindspeed_llm is not available (checkpoint stores Llama2Tokenizer).
+        if not mindspeed_available:
+            from megatron.training import checkpointing as ckpt_module
+            _orig_load_args = ckpt_module.load_args_from_checkpoint
+            def _patched_load_args_from_checkpoint(args):
+                _orig_load_args(args)
+                args.tokenizer_type = kwargs["tokenizer_type"]
+                if kwargs.get("tokenizer_model"):
+                    args.tokenizer_model = kwargs["tokenizer_model"]
+                eval_logger.info(
+                    f"Restored tokenizer_type: {kwargs['tokenizer_type']}"
+                )
+            ckpt_module.load_args_from_checkpoint = _patched_load_args_from_checkpoint
+            import megatron.training.initialize as megatron_init
+            if hasattr(megatron_init, "load_args_from_checkpoint"):
+                megatron_init.load_args_from_checkpoint = _patched_load_args_from_checkpoint
+            eval_logger.info("Patched load_args_from_checkpoint for NPU tokenizer compatibility")
 
-        # Add extra MCore arguments
+        # Add extra MCore arguments (appended last so they take precedence)
         extra_args_list = _parse_extra_args(kwargs.get("extra_args"))
         if extra_args_list:
             argv.extend(extra_args_list)
@@ -652,40 +600,29 @@ class MindSpeedLMEval(LM):
         # Save original argv and replace
         original_argv = sys.argv
         sys.argv = argv
-
         eval_logger.info(f"Initializing Megatron with args: {' '.join(argv[1:])}")
 
         try:
-            # Initialize Megatron
-            # On NPU, pass allow_no_cuda=True to skip the hard CUDA assertion
-            # inside MindSpeed-LLM's initialize_megatron.  This is only
-            # accepted by the MindSpeed-LLM version; the base Megatron-LM
-            # version does not have this parameter, but on CUDA machines we
-            # never set it, so the call is safe in either case.
             init_kwargs = {
                 "extra_args_provider": None,
                 "args_defaults": {"tokenizer_type": kwargs["tokenizer_type"]},
             }
-            if _is_torch_npu_available():
+            if AscendNPUPatch.is_available():
                 init_kwargs["allow_no_cuda"] = True
             initialize_megatron(**init_kwargs)
 
             args = get_args()
             self._args = args
 
-            # Import parallel state utilities after initialization
             from megatron.core import parallel_state
-
             self._parallel_state = parallel_state
 
-            # Store parallel info
             self._is_pipeline_last_stage = parallel_state.is_pipeline_last_stage()
             self._is_pipeline_first_stage = parallel_state.is_pipeline_first_stage()
             self._tp_rank = parallel_state.get_tensor_model_parallel_rank()
             self._pp_rank = parallel_state.get_pipeline_model_parallel_rank()
             self._dp_rank = parallel_state.get_data_parallel_rank()
 
-            # Set up device and rank info based on parallelism mode
             self._device = get_current_device()
             self._global_rank = (
                 torch.distributed.get_rank()
@@ -694,7 +631,6 @@ class MindSpeedLMEval(LM):
             )
 
             if self._parallelism_mode == "data_parallel":
-                # Data Parallelism: each rank is a separate worker processing different data
                 self._rank = self._global_rank
                 self._world_size = devices
             else:
@@ -711,13 +647,13 @@ class MindSpeedLMEval(LM):
                 f"DP rank: {self._dp_rank}, is_last_stage: {self._is_pipeline_last_stage}"
             )
 
-            # Get tokenizer
+            # Get tokenizer and fix padded_vocab_size if needed
             self.tokenizer = get_tokenizer()
+            if not mindspeed_available and kwargs.get("tokenizer_name_or_path"):
+                self._fix_padded_vocab_size(args, kwargs)
 
-            # Create model_provider
-            def model_provider(
-                pre_process=True, post_process=True, config=None, pg_collection=None
-            ):
+            # Create model_provider (aligned with megatron_lm.py)
+            def model_provider(pre_process=True, post_process=True, config=None, pg_collection=None):
                 """Build GPT model."""
                 from megatron.core.models.gpt import GPTModel
                 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -726,127 +662,64 @@ class MindSpeedLMEval(LM):
                     get_gpt_layer_with_transformer_engine_spec,
                 )
 
-                # Get config from args if not provided
                 if config is None:
-                    if getattr(args, "yaml_cfg", None) is not None:
-                        from megatron.training.yaml_arguments import (
-                            core_transformer_config_from_yaml,
-                        )
-                        config = core_transformer_config_from_yaml(args, "language_model")
-                    else:
-                        config = core_transformer_config_from_args(args)
+                    config = core_transformer_config_from_args(args)
 
-                # Select layer spec.
-                # Priority: --spec > MoE > heterogeneous > TE > local
-                if args.spec is not None:
-                    from megatron.core.transformer.spec_utils import import_module
-                    transformer_layer_spec = import_module(args.spec)
-                elif args.num_experts:
-                    # For MoE models, use decoder block spec so each layer follows moe_layer_freq.
-                    transformer_impl = getattr(args, "transformer_impl", "local")
-                    use_transformer_engine = transformer_impl == "transformer_engine"
-                    assert config.transformer_impl != "inference_optimized", (
-                        "MoE is not supported with inference_optimized transformer_impl."
-                    )
+                # When mindspeed_llm is unavailable, the checkpoint may not have
+                # GQA args (num_query_groups/group_query_attention). Force them
+                # from extra_args so the model matches the checkpoint.
+                gqa_groups = getattr(args, "num_query_groups", None)
+                if gqa_groups is not None:
+                    config.num_query_groups = gqa_groups
+
+                # Select layer spec (aligned with megatron_lm.py)
+                transformer_impl = getattr(args, "transformer_impl", "local")
+                use_transformer_engine = transformer_impl == "transformer_engine"
+                if args.num_experts:
                     transformer_layer_spec = get_gpt_decoder_block_spec(
-                        config,
-                        use_transformer_engine=use_transformer_engine,
+                        config, use_transformer_engine=use_transformer_engine,
                         normalization=getattr(args, "normalization", None),
                         qk_l2_norm=getattr(args, "qk_l2_norm", False),
                     )
-                else:
-                    transformer_impl = getattr(args, "transformer_impl", "local")
-                    use_transformer_engine = transformer_impl == "transformer_engine"
-                    if getattr(args, "heterogeneous_layers_config_path", None) is not None:
-                        assert config.transformer_impl != "inference_optimized", (
-                            "Heterogeneous layers are not supported with inference_optimized transformer_impl."
+                elif getattr(args, "heterogeneous_layers_config_path", None):
+                    try:
+                        from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
+                            get_gpt_heterogeneous_layer_spec,
                         )
-                        try:
-                            from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
-                                get_gpt_heterogeneous_layer_spec,
-                            )
-                            transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
-                                config, use_transformer_engine=use_transformer_engine
-                            )
-                        except ImportError:
-                            eval_logger.warning(
-                                "heterogeneous_layer_spec not available in this Megatron version; "
-                                "falling back to local spec."
-                            )
-                            transformer_layer_spec = get_gpt_layer_local_spec(
-                                getattr(args, "num_experts", None),
-                                getattr(args, "moe_grouped_gemm", False),
-                                getattr(args, "qk_layernorm", False),
-                                getattr(args, "multi_latent_attention", False),
-                            )
-                    elif use_transformer_engine:
-                        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                            getattr(args, "num_experts", None),
-                            getattr(args, "moe_grouped_gemm", False),
-                            getattr(args, "qk_layernorm", False),
-                            getattr(args, "multi_latent_attention", False),
+                        transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
+                            config, use_transformer_engine=use_transformer_engine
                         )
-                    else:
+                    except ImportError:
+                        eval_logger.warning("heterogeneous_layer_spec not available; falling back to local spec")
                         transformer_layer_spec = get_gpt_layer_local_spec(
                             getattr(args, "num_experts", None),
                             getattr(args, "moe_grouped_gemm", False),
                             getattr(args, "qk_layernorm", False),
                             getattr(args, "multi_latent_attention", False),
                         )
-
-                # Force SelfAttention's default attn_mask_type to `arbitrary` so TE uses the
-                # provided 4D attention mask (causal + padding) instead of assuming a causal-only
-                # mask internally. Without this, padding tokens can remain visible (especially with
-                # left-padding / batched inference), which leads to incorrect attention and wrong
-                # inference results.
-                from megatron.core.transformer.enums import (  # pylint: disable=import-error
-                    AttnMaskType,
-                )
-
-                try:
-                    updated = 0
-
-                    # Single layer spec.
-                    self_attention = getattr(
-                        getattr(transformer_layer_spec, "submodules", None),
-                        "self_attention",
-                        None,
+                elif use_transformer_engine:
+                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                        getattr(args, "num_experts", None),
+                        getattr(args, "moe_grouped_gemm", False),
+                        getattr(args, "qk_layernorm", False),
+                        getattr(args, "multi_latent_attention", False),
                     )
-                    params = getattr(self_attention, "params", None)
-                    if isinstance(params, dict):
-                        params["attn_mask_type"] = AttnMaskType.arbitrary
-                        updated += 1
+                else:
+                    transformer_layer_spec = get_gpt_layer_local_spec(
+                        getattr(args, "num_experts", None),
+                        getattr(args, "moe_grouped_gemm", False),
+                        getattr(args, "qk_layernorm", False),
+                        getattr(args, "multi_latent_attention", False),
+                    )
 
-                    # Decoder block spec (list of layer specs).
-                    layer_specs = getattr(transformer_layer_spec, "layer_specs", None)
-                    if layer_specs is not None:
-                        for layer_spec in layer_specs:
-                            layer_self_attention = getattr(
-                                getattr(layer_spec, "submodules", None),
-                                "self_attention",
-                                None,
-                            )
-                            layer_params = getattr(layer_self_attention, "params", None)
-                            if isinstance(layer_params, dict):
-                                layer_params["attn_mask_type"] = AttnMaskType.arbitrary
-                                updated += 1
-
-                    if updated == 0:
-                        eval_logger.warning(
-                            "No self_attention params found to override attn_mask_type; "
-                            "proceeding with original spec defaults."
-                        )
-                except Exception as e:
-                    raise RuntimeError(
-                        "Failed to override attn_mask_type on transformer_layer_spec. "
-                        "Expected ModuleSpec or decoder block layer specs with self_attention.params."
-                    ) from e
+                # Override attn_mask_type to arbitrary for proper padding handling
+                self._override_attn_mask(transformer_layer_spec)
 
                 model = GPTModel(
                     config=config,
                     transformer_layer_spec=transformer_layer_spec,
                     vocab_size=args.padded_vocab_size,
-                    max_sequence_length=getattr(args, "max_position_embeddings", args.seq_length),
+                    max_sequence_length=args.seq_length,
                     pre_process=pre_process,
                     post_process=post_process,
                     fp16_lm_cross_entropy=getattr(args, "fp16_lm_cross_entropy", False),
@@ -854,33 +727,62 @@ class MindSpeedLMEval(LM):
                     share_embeddings_and_output_weights=not getattr(
                         args, "untie_embeddings_and_output_weights", False
                     ),
-                    position_embedding_type=getattr(
-                        args, "position_embedding_type", "learned_absolute"
-                    ),
+                    position_embedding_type=getattr(args, "position_embedding_type", "learned_absolute"),
                     rotary_percent=getattr(args, "rotary_percent", 1.0),
                     rotary_base=getattr(args, "rotary_base", 10000),
-                    seq_len_interpolation_factor=getattr(
-                        args, "rotary_seq_len_interpolation_factor", None
-                    ),
+                    seq_len_interpolation_factor=getattr(args, "rotary_seq_len_interpolation_factor", None),
                 )
-
                 return model
 
-            # Get model
+            # Get model and load checkpoint
             self._model = get_model(model_provider, wrap_with_ddp=False)
-
-            # Load checkpoint
             load_checkpoint(self._model, None, None, strict=True)
 
-            # Extract single model (no virtual pipeline parallelism)
             assert len(self._model) == 1, f"Expected 1 model, got {len(self._model)}"
             self.model = self._model[0]
             self.model.eval()
-
             eval_logger.info("Model loaded successfully!")
 
         finally:
             sys.argv = original_argv
+
+    @staticmethod
+    def _override_attn_mask(transformer_layer_spec):
+        """Force SelfAttention attn_mask_type to arbitrary for left-padding."""
+        from megatron.core.transformer.enums import AttnMaskType
+        try:
+            self_attention = getattr(
+                getattr(transformer_layer_spec, "submodules", None),
+                "self_attention", None,
+            )
+            params = getattr(self_attention, "params", None)
+            if isinstance(params, dict):
+                params["attn_mask_type"] = AttnMaskType.arbitrary
+            layer_specs = getattr(transformer_layer_spec, "layer_specs", None)
+            if layer_specs:
+                for ls in layer_specs:
+                    p = getattr(getattr(ls, "submodules", None), "self_attention", None)
+                    if p and isinstance(getattr(p, "params", None), dict):
+                        p.params["attn_mask_type"] = AttnMaskType.arbitrary
+        except (AttributeError, TypeError):
+            pass  # Best-effort override
+
+    @staticmethod
+    def _fix_padded_vocab_size(args, kwargs):
+        """Override padded_vocab_size from HF config.json (checkpoint mismatch)."""
+        if kwargs.get("tokenizer_name_or_path"):
+            try:
+                import json as _json
+                cfg_path = os.path.join(kwargs["tokenizer_name_or_path"], "config.json")
+                with open(cfg_path) as f:
+                    hf_vocab_size = _json.load(f).get("vocab_size")
+                if hf_vocab_size is not None:
+                    eval_logger.info(
+                        f"Overriding padded_vocab_size: {args.padded_vocab_size} -> {hf_vocab_size}"
+                    )
+                    args.padded_vocab_size = hf_vocab_size
+            except (OSError, ValueError, KeyError):
+                pass  # Best-effort HF config load
 
     @property
     def eot_token_id(self) -> int:
@@ -1038,59 +940,26 @@ class MindSpeedLMEval(LM):
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Model forward pass.
-
-        For EP > 1 (Expert Parallelism):
-        - MoE layers use all-to-all communication which provides implicit synchronization
-
-        Args:
-            input_ids: [batch_size, seq_len]
-            position_ids: [batch_size, seq_len] or None
-            attention_mask: [batch_size, seq_len] with 1=real token, 0=padding, or None
-
-        Returns:
-            logits: [batch_size, seq_len, vocab_size] on all ranks
-        """
+        """Model forward pass (aligned with megatron_lm.py)."""
         batch_size, seq_len = input_ids.shape
 
-        # Create causal mask for Megatron format
-        # Megatron expects: True = masked (cannot attend), False = can attend
-        # So we use triu (upper triangular) with diagonal=1: positions j > i are masked
         causal_mask = torch.ones(
             (batch_size, 1, seq_len, seq_len), dtype=torch.bool, device=input_ids.device
-        ).triu(diagonal=1)  # True for positions that should be masked (future tokens)
+        ).triu(diagonal=1)
 
         if attention_mask is not None and attention_mask.dim() == 2:
-            # attention_mask: [batch, seq] with 1=real, 0=padding
-
-            # For RoPE models: use standard position_ids [0, 1, 2, ...] for all samples
-            # This is because RoPE encodes relative positions, and using mask-based
-            # position_ids (where padding positions all have pos=0) can cause issues
-            # with the position encoding computation.
             if position_ids is None:
                 position_ids = torch.arange(
                     seq_len, dtype=torch.long, device=input_ids.device
-                )
-                position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+                ).unsqueeze(0).expand(batch_size, -1)
 
-            # Create padding mask for Megatron format
-            # padding_mask: True = padding (should be masked), False = real token
-            # attention_mask has 1=real, 0=padding, so we invert it
-            padding_mask = (
-                (1 - attention_mask).unsqueeze(1).unsqueeze(2).bool()
-            )  # [batch, 1, 1, seq]
-
-            # Combine masks: a position is masked if:
-            # 1. It's a future token (causal_mask=True) OR 2. It's a padding token (padding_mask=True)
+            padding_mask = (1 - attention_mask).unsqueeze(1).unsqueeze(2).bool()
             attention_mask = causal_mask | padding_mask
         else:
-            # No padding - use standard position_ids
             if position_ids is None:
                 position_ids = torch.arange(
                     seq_len, dtype=torch.long, device=input_ids.device
-                )
-                position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+                ).unsqueeze(0).expand(batch_size, -1)
             attention_mask = causal_mask
 
         with torch.no_grad():
