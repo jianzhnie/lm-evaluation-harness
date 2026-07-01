@@ -102,13 +102,26 @@ class VLLM(TemplateLM):
         assert max_length is None or max_model_len is None, (
             "Either max_length or max_model_len may be provided, but not both"
         )
-        kwargs.pop("device", None)
+        if "device" in kwargs:
+            eval_logger.warning(
+                "The `device` argument is ignored by the vLLM backend. To select "
+                "which GPU(s) vLLM can use, set the `CUDA_VISIBLE_DEVICES` "
+                "environment variable before running lm-eval."
+            )
+            kwargs.pop("device")
         self.think_end_token = think_end_token
         self._max_length = max_model_len if max_model_len is not None else max_length
         self.tensor_parallel_size = int(tensor_parallel_size)
         # truncation strategy for inputs exceeding max length
         self.truncation_side = truncation_side
         self.data_parallel_size = int(data_parallel_size)
+        if self.data_parallel_size > 1 and kwargs.get("enable_expert_parallel", False):
+            raise ValueError(
+                "data_parallel_size > 1 is not supported with enable_expert_parallel=True. "
+                "lm-eval dispatches data parallelism through independent Ray workers, which "
+                "does not provide a single coordinated MoE expert-parallel engine. "
+                "Use tensor_parallel_size > 1 with data_parallel_size=1 instead."
+            )
         if self.data_parallel_size > 1 and not find_spec("ray"):
             raise ModuleNotFoundError(
                 "ray is required for data parallelism. Please install ray using `pip install ray`."
@@ -313,7 +326,11 @@ class VLLM(TemplateLM):
             return []
 
         _string: list[str] = [string] if isinstance(string, str) else string
-        _bos_token = self.tokenizer.decode(self.prefix_token_id)
+        _bos_token = (
+            self.tokenizer.decode(self.prefix_token_id)
+            if self.prefix_token_id is not None
+            else None
+        )
 
         special_tokens_kwargs = {
             **kwargs,
@@ -595,9 +612,21 @@ class VLLM(TemplateLM):
                 )
                 context_encoding_truncated.append(toks)
 
-                sampling_params.append(
-                    SamplingParams(max_tokens=max_gen_toks, stop=until, **kwargs)
-                )
+                # When a reasoning model is active, task-level stop sequences
+                # (e.g. the fewshot delimiter "\n\n") should not go to vLLM —
+                # they often exist inside <think> blocks and cause it to truncate
+                # before any response is produced.  Only EOS should be passed
+                # to vLLM; task stops are applied in postprocess_generated_text
+                # after thinking content is stripped.
+                if self.think_end_token:
+                    eos_only = [s for s in until if s == eos]
+                    sampling_params.append(
+                        SamplingParams(max_tokens=max_gen_toks, stop=eos_only, **kwargs)
+                    )
+                else:
+                    sampling_params.append(
+                        SamplingParams(max_tokens=max_gen_toks, stop=until, **kwargs)
+                    )
                 _cache_gen_kwargs.append(
                     kwargs | {"until": until, "max_gen_toks": max_gen_toks}
                 )
