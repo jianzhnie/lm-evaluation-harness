@@ -36,7 +36,8 @@ lm-evaluation-harness/
 │   │   ├── hf/               # HuggingFace Transformers
 │   │   ├── vllm_causallms.py # vLLM 推理
 │   │   ├── sglang.py         # SGLang 推理
-│   │   ├── megatron_lm.py    # Megatron-LM (支持 NPU)
+│   │   ├── megatron_lm.py    # Megatron-LM
+│   │   ├── mindspeed_lm.py   # MindSpeed-LLM (华为昇腾 NPU)
 │   │   ├── openai/           # OpenAI API
 │   │   ├── anthropic/        # Anthropic API
 │   │   └── ...               # 其他后端
@@ -186,6 +187,7 @@ lm_eval --model openai-completions \
 | llama.cpp (GGUF/GGML) | `gguf` / `ggml` | generate_until, loglikelihood |
 | NVIDIA NeMo | `nemo_lm` | generate_until, loglikelihood, loglikelihood_rolling |
 | NVIDIA Megatron-LM | `megatron_lm` | generate_until, loglikelihood, loglikelihood_rolling |
+| MindSpeed-LLM (昇腾 NPU) | `mindspeed_lm` | generate_until, loglikelihood, loglikelihood_rolling |
 | Mamba | `mamba_ssm` | generate_until, loglikelihood, loglikelihood_rolling |
 | OpenVINO | `openvino` | generate_until, loglikelihood, loglikelihood_rolling |
 | Intel IPEX | `ipex` | generate_until, loglikelihood, loglikelihood_rolling |
@@ -330,43 +332,51 @@ accelerate launch -m lm_eval --model hf \
     --batch_size 16
 ```
 
+#### MindSpeed-LLM 后端 + NPU (推荐)
+
+`mindspeed_lm` 后端基于华为 MindSpeed-LLM 框架，专为 Ascend NPU 优化。内置 `AscendNPUPatch` 自动处理 CUDA→NPU 适配，无需手动配置分布式后端。
+
+```bash
+export MEGATRON_PATH=/path/to/MindSpeed-LLM
+export CKPT_PATH=/path/to/megatron_ckpt
+export TOKENIZER_MODEL=/path/to/tokenizer
+
+# 快速启动（使用预设 run.sh）
+bash run.sh
+
+# 单卡 NPU
+torchrun --nproc-per-node=1 -m lm_eval --model mindspeed_lm \
+    --model_args "load=${CKPT_PATH},tokenizer_type=PretrainedFromHF,tokenizer_name_or_path=${TOKENIZER_MODEL},devices=1" \
+    --tasks hellaswag --batch_size 8
+
+# 张量并行 (4 卡 NPU)
+torchrun --nproc-per-node=4 -m lm_eval --model mindspeed_lm \
+    --model_args "load=${CKPT_PATH},tokenizer_type=PretrainedFromHF,tokenizer_name_or_path=${TOKENIZER_MODEL},devices=4,tensor_model_parallel_size=4" \
+    --tasks hellaswag --batch_size 8
+```
+
 #### Megatron-LM 后端 + NPU
 
-Megatron-LM 后端已完整适配 NPU，支持数据并行 (DP)、张量并行 (TP)、专家并行 (EP) 三种分布式策略。
+Megatron-LM 后端同样支持 NPU：
 
 ```bash
 export MEGATRON_PATH=/path/to/Megatron-LM
 
-# 单卡 NPU
-torchrun --nproc-per-node=1 -m lm_eval --model megatron_lm \
-    --model_args load=/path/to/ckpt,tokenizer_model=/path/to/tokenizer.model \
-    --tasks hellaswag --batch_size 8
-
-# 数据并行 (4 卡 NPU，每卡加载完整模型副本)
-torchrun --nproc-per-node=4 -m lm_eval --model megatron_lm \
-    --model_args load=/path/to/ckpt,devices=4,tokenizer_model=/path/to/tokenizer.model \
-    --tasks hellaswag --batch_size 8
-
-# 张量并行 (2 卡 NPU，模型层切分)
 torchrun --nproc-per-node=2 -m lm_eval --model megatron_lm \
     --model_args load=/path/to/ckpt,devices=2,tensor_model_parallel_size=2,tokenizer_model=/path/to/tokenizer.model \
-    --tasks hellaswag --batch_size 8
-
-# 专家并行 (4 卡 NPU，MoE 模型专家分布)
-torchrun --nproc-per-node=4 -m lm_eval --model megatron_lm \
-    --model_args load=/path/to/moe_ckpt,devices=4,expert_model_parallel_size=4,tokenizer_model=/path/to/tokenizer.model \
     --tasks hellaswag --batch_size 8
 ```
 
 #### NPU 分布式策略对照
 
-| 并行策略 | 参数 | 分布式后端 | 说明 |
-|----------|------|-----------|------|
-| 数据并行 (DP) | `devices=N, TP=1` | HCCL | 每卡完整模型，数据分片 |
+| 并行策略 | `mindspeed_lm` 用法 | 分布式后端 | 说明 |
+|----------|---------------------|-----------|------|
+| 单卡 | `devices=1` | HCCL | 单 NPU 评估 |
+| 数据并行 (DP) | `devices=N, TP=1` | HCCL | 每卡完整模型, 数据分片 |
 | 张量并行 (TP) | `devices=N, tensor_model_parallel_size=N` | HCCL | 模型层切分到多卡 |
 | 专家并行 (EP) | `devices=N, expert_model_parallel_size=N` | HCCL | MoE 专家分布到多卡 |
-| TP + 采样 | 同 TP | HCCL + broadcast | 采样时从 rank 0 广播 token 保证一致性 |
-| EP 同步退出 | 同 EP | HCCL all_reduce | 所有 rank 同步退出避免死锁 |
+
+> `AscendNPUPatch` 类自动处理 NPU 适配：`torch.cuda` → `torch.npu` API 映射，`nccl` → `hccl` 重定向，默认生成器初始化，`_compile_dependencies` 禁用。启动脚本 `npu_mindspeed-llm_eval.sh` 封装了常用模式。
 
 #### NPU 设备管理 API (`lm_eval/device.py`)
 
