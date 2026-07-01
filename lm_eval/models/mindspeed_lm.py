@@ -22,7 +22,7 @@ Parallelism Modes:
        - Tokens are routed via All-to-All communication
        - EP cannot be combined with TP or PP
 
-Note: Pipeline Parallelism (PP > 1) is NOT currently supported.
+Note: Pipeline Parallelism is supported for TP + PP combinations (devices = TP × PP).
 
 Requirements:
     - MindSpeed-LLM must be installed and accessible via MEGATRON_PATH environment variable
@@ -416,14 +416,8 @@ class MindSpeedLMEval(LM):
         - EP must equal devices (all ranks form one model-parallel group)
         - EP is model parallelism (world_size=1), not data parallelism
 
-        Note: Pipeline Parallelism (PP > 1) is NOT currently supported.
+        Note: Pipeline Parallelism is supported for TP + PP combinations (devices = TP × PP).
         """
-        # Validate PP configuration - PP > 1 is not supported
-        assert pp == 1, (
-            f"Pipeline Parallelism (PP={pp}) is not currently supported. "
-            f"Please use Tensor Parallelism (TP) or Data Parallelism instead."
-        )
-
         # Validate EP configuration
         if ep > 1:
             # EP cannot be combined with TP or PP
@@ -440,16 +434,12 @@ class MindSpeedLMEval(LM):
                     f"When using Expert Parallelism (EP > 1), devices must equal expert-model-parallel-size."
                 )
 
-        # At this point, pp == 1 is guaranteed (pp > 1 was rejected above)
+        # Determine parallelism mode
+        total_model_parallel = tp * pp
         if ep > 1:
-            # Expert Parallelism: all ranks form one model-parallel group
-            # (each rank holds different MoE experts; all-to-all communication
-            # requires all ranks to participate in every forward pass).
             self._parallelism_mode = "expert_parallel"
-            eval_logger.info(
-                f"Parallelism mode: Expert Parallel (EP={ep}, devices={devices})"
-            )
-        elif tp == 1:
+            eval_logger.info(f"Parallelism mode: Expert Parallel (EP={ep}, devices={devices})")
+        elif tp == 1 and pp == 1:
             if devices == 1:
                 self._parallelism_mode = "single"
                 eval_logger.info("Parallelism mode: Single GPU")
@@ -458,14 +448,22 @@ class MindSpeedLMEval(LM):
                 eval_logger.info(
                     f"Parallelism mode: Data Parallel with {devices} replicas"
                 )
-        elif tp == devices:
+        elif devices == total_model_parallel:
+            # TP and/or PP: all ranks form one model-parallel group
+            parts = []
+            if tp > 1:
+                parts.append(f"TP={tp}")
+            if pp > 1:
+                parts.append(f"PP={pp}")
             self._parallelism_mode = "tensor_parallel"
-            eval_logger.info(f"Parallelism mode: Tensor Parallel (TP={tp})")
+            eval_logger.info(
+                f"Parallelism mode: {' + '.join(parts)} (devices={devices})"
+            )
         else:
             raise ValueError(
-                f"Invalid parallelism configuration: devices={devices}, TP={tp}. "
-                f"For tensor parallelism, TP must equal devices. "
-                f"For data parallelism, set TP=1."
+                f"Invalid parallelism configuration: devices={devices}, TP={tp}, PP={pp}. "
+                f"For model parallelism, TP × PP must equal devices ({total_model_parallel}). "
+                f"For data parallelism, set TP=1, PP=1."
             )
 
     def _initialize_megatron(self, **kwargs):
@@ -1111,10 +1109,18 @@ class MindSpeedLMEval(LM):
                 attention_mask_list, dtype=torch.long, device=self.device
             )
 
-            # Forward pass (handles TP/PP internally)
+            # Forward pass: with PP > 1, ALL stages must participate in
+            # the forward pass for P2P send/recv, but only the last PP
+            # stage produces valid logits.
             logits = self._model_forward(input_ids, attention_mask=attention_mask)
 
-            # Compute log probabilities
+            # Compute results only on the last PP stage
+            if not self._is_pipeline_last_stage:
+                for _, ctx, cont in chunk:
+                    res.append((0.0, False))
+                pbar.update(len(chunk))
+                continue
+
             log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
 
             for i, (ctxlen, contlen) in enumerate(zip(ctxlens, contlens, strict=True)):
